@@ -13,11 +13,17 @@ import {
   Sun,
   CloudMoon,
   Settings,
-  Check
+  Check,
+  Download,
+  Loader2
 } from 'lucide-react';
 import { getCurrentWindow } from '@tauri-apps/api/window';
 import { invoke } from '@tauri-apps/api/core';
+import { getVersion } from '@tauri-apps/api/app';
 import { enable, disable, isEnabled } from '@tauri-apps/plugin-autostart';
+import { check, type Update } from '@tauri-apps/plugin-updater';
+import { relaunch } from '@tauri-apps/plugin-process';
+import { openUrl } from '@tauri-apps/plugin-opener';
 
 // Импорты фонов
 import DaySvg from './assets/day.svg';
@@ -74,6 +80,18 @@ interface I18n {
   autostartEnabled: string;
   autostartDisabled: string;
   autostartFailed: string;
+  checkUpdates: string;
+  checkingUpdates: string;
+  upToDate: string;
+  checkFailed: string;
+  updateAvailable: (v: string) => string;
+  updateDesc: (v: string) => string;
+  downloadAndInstall: string;
+  later: string;
+  downloading: (p: number) => string;
+  installing: string;
+  openReleases: string;
+  updateError: string;
 }
 
 const T: Record<Lang, I18n> = {
@@ -114,6 +132,18 @@ const T: Record<Lang, I18n> = {
     autostartEnabled: 'Launch at login enabled.',
     autostartDisabled: 'Launch at login disabled.',
     autostartFailed: 'Failed to change autostart. Run the built app.',
+    checkUpdates: 'Check for updates',
+    checkingUpdates: 'Checking...',
+    upToDate: 'You are up to date.',
+    checkFailed: 'Failed to check for updates.',
+    updateAvailable: (v) => `Update available: v${v}`,
+    updateDesc: (v) => `A new version (v${v}) is available. Download and install it?`,
+    downloadAndInstall: 'Download & Install',
+    later: 'Later',
+    downloading: (p) => `Downloading... ${p}%`,
+    installing: 'Installing...',
+    openReleases: 'Open Releases page',
+    updateError: 'Update failed. Download manually instead.',
   },
   ru: {
     greetingMorning: 'Доброе утро!',
@@ -152,6 +182,18 @@ const T: Record<Lang, I18n> = {
     autostartEnabled: 'Автозапуск включён.',
     autostartDisabled: 'Автозапуск выключен.',
     autostartFailed: 'Не удалось изменить автозапуск. Запустите собранное приложение.',
+    checkUpdates: 'Проверить обновления',
+    checkingUpdates: 'Проверка...',
+    upToDate: 'Установлена последняя версия.',
+    checkFailed: 'Не удалось проверить обновления.',
+    updateAvailable: (v) => `Доступно обновление: v${v}`,
+    updateDesc: (v) => `Доступна новая версия (v${v}). Скачать и установить?`,
+    downloadAndInstall: 'Скачать и установить',
+    later: 'Позже',
+    downloading: (p) => `Загрузка... ${p}%`,
+    installing: 'Установка...',
+    openReleases: 'Открыть страницу релизов',
+    updateError: 'Ошибка обновления. Скачайте вручную.',
   },
 };
 
@@ -406,6 +448,19 @@ const SettingRow: React.FC<{ title: string; sub: string; on: boolean; accent: st
   </div>
 );
 
+const SettingButtonRow: React.FC<{ title: string; sub: string; busyText: string; busy: boolean; accent: string; onClick: () => void }> = ({ title, sub, busyText, busy, accent, onClick }) => (
+  <button onClick={onClick} disabled={busy}
+    className="w-full flex items-center justify-between gap-3 py-2 rounded-lg transition-colors disabled:opacity-60 hover:bg-white/5 px-1 -mx-1">
+    <div className="flex flex-col gap-0.5 text-left">
+      <span className="text-[11px] font-semibold text-white leading-none">{title}</span>
+      <span className="text-[9px] text-white/50 leading-tight mt-0.5">{busy ? busyText : ''}</span>
+    </div>
+    {busy
+      ? <Loader2 size={13} className="animate-spin text-white/60 shrink-0" />
+      : <span className="text-[9px] font-bold tracking-widest uppercase px-2 py-1 rounded-full shrink-0" style={{ color: accent }}>{sub}</span>}
+  </button>
+);
+
 interface SettingsPanelProps {
   autoStart: boolean;
   settings: BehaviorSettings;
@@ -415,9 +470,12 @@ interface SettingsPanelProps {
   lang: Lang;
   onLangChange: (l: Lang) => void;
   t: I18n;
+  appVersion: string;
+  checkingUpdate: boolean;
+  onCheckUpdates: () => void;
 }
 
-const SettingsPanel: React.FC<SettingsPanelProps> = ({ autoStart, settings, onToggleAutoStart, onToggleSetting, accent, lang, onLangChange, t }) => (
+const SettingsPanel: React.FC<SettingsPanelProps> = ({ autoStart, settings, onToggleAutoStart, onToggleSetting, accent, lang, onLangChange, t, appVersion, checkingUpdate, onCheckUpdates }) => (
   <motion.div
     initial={{ opacity: 0, y: -8, scale: 0.96 }}
     animate={{ opacity: 1, y: 0, scale: 1 }}
@@ -440,6 +498,9 @@ const SettingsPanel: React.FC<SettingsPanelProps> = ({ autoStart, settings, onTo
       on={settings.rememberAction} accent={accent} onToggle={() => onToggleSetting('rememberAction')} />
     <SettingRow title={t.soundAtEnd} sub={t.soundAtEndSub}
       on={settings.soundAtEnd} accent={accent} onToggle={() => onToggleSetting('soundAtEnd')} />
+    <div className="h-px bg-white/10 my-1" />
+    <SettingButtonRow title={t.checkUpdates} sub={`v${appVersion}`} busyText={t.checkingUpdates}
+      busy={checkingUpdate} accent={accent} onClick={onCheckUpdates} />
     <div className="h-px bg-white/10 my-1" />
     <div className="flex items-center justify-between gap-3 py-2">
       <span className="text-[11px] font-semibold text-white leading-none">{t.language}</span>
@@ -473,6 +534,17 @@ export default function App() {
   const [lang, setLang] = useState<Lang>(() => {
     try { return (localStorage.getItem('lang') as Lang) || 'en'; } catch { return 'en'; }
   });
+  const [appVersion, setAppVersion] = useState('');
+  const [checkingUpdate, setCheckingUpdate] = useState(false);
+  const [updateModal, setUpdateModal] = useState<
+    | { status: 'available'; version: string }
+    | { status: 'downloading'; progress: number }
+    | { status: 'installing' }
+    | { status: 'error' }
+    | null
+  >(null);
+  const updateRef = useRef<Update | null>(null);
+  const autoChecked = useRef(false);
   const dropRef = useRef<HTMLDivElement>(null);
   const settingsRef = useRef<HTMLDivElement>(null);
 
@@ -483,6 +555,60 @@ export default function App() {
   const changeLang = (l: Lang) => {
     setLang(l);
     try { localStorage.setItem('lang', l); } catch (e) { console.warn(e); }
+  };
+
+  useEffect(() => {
+    getVersion().then(setAppVersion).catch(() => {});
+  }, []);
+
+  const checkForUpdates = useCallback(async (manual: boolean) => {
+    setCheckingUpdate(true);
+    try {
+      const update = await check();
+      if (update) {
+        updateRef.current = update;
+        setUpdateModal({ status: 'available', version: update.version });
+      } else if (manual) {
+        setToast({ message: T[lang].upToDate, type: 'success' });
+      }
+    } catch (e) {
+      console.error('Update check failed:', e);
+      if (manual) setToast({ message: T[lang].checkFailed, type: 'error' });
+    } finally {
+      setCheckingUpdate(false);
+    }
+  }, [lang]);
+
+  useEffect(() => {
+    if (mode === 'idle' && !autoChecked.current) {
+      autoChecked.current = true;
+      setTimeout(() => checkForUpdates(false), 3000);
+    }
+  }, [mode, checkForUpdates]);
+
+  const handleDownloadUpdate = async () => {
+    const update = updateRef.current;
+    if (!update) return;
+    try {
+      setUpdateModal({ status: 'downloading', progress: 0 });
+      let downloaded = 0;
+      let total = 0;
+      await update.download((event) => {
+        if (event.event === 'Started') {
+          total = event.data.contentLength ?? 0;
+        } else if (event.event === 'Progress') {
+          downloaded += event.data.chunkLength;
+          const pct = total > 0 ? Math.min(100, Math.round((downloaded / total) * 100)) : 0;
+          setUpdateModal({ status: 'downloading', progress: pct });
+        }
+      });
+      setUpdateModal({ status: 'installing' });
+      await update.install();
+      await relaunch();
+    } catch (e) {
+      console.error('Update failed:', e);
+      setUpdateModal({ status: 'error' });
+    }
   };
 
   // Авто-определение времени суток
@@ -699,7 +825,7 @@ export default function App() {
         <div ref={settingsRef} className="absolute top-12 right-3 z-40 pointer-events-auto">
           <AnimatePresence>
             {settingsOpen && (
-              <SettingsPanel autoStart={autoStart} settings={settings} onToggleAutoStart={toggleAutoStart} onToggleSetting={updateSetting} accent={accentColor} lang={lang} onLangChange={changeLang} t={t} />
+              <SettingsPanel autoStart={autoStart} settings={settings} onToggleAutoStart={toggleAutoStart} onToggleSetting={updateSetting} accent={accentColor} lang={lang} onLangChange={changeLang} t={t} appVersion={appVersion} checkingUpdate={checkingUpdate} onCheckUpdates={() => checkForUpdates(true)} />
             )}
           </AnimatePresence>
         </div>
@@ -846,6 +972,84 @@ export default function App() {
             </AnimatePresence>
           </div>
         </div>
+
+        {/* Update modal */}
+        <AnimatePresence>
+          {updateModal && (
+            <motion.div
+              initial={{ opacity: 0 }}
+              animate={{ opacity: 1 }}
+              exit={{ opacity: 0 }}
+              className="absolute inset-0 z-40 flex items-center justify-center rounded-[2.5rem]"
+              style={{ backgroundColor: 'rgba(10, 11, 14, 0.6)', backdropFilter: 'blur(8px)' }}
+            >
+              <motion.div
+                initial={{ opacity: 0, scale: 0.9, y: 10 }}
+                animate={{ opacity: 1, scale: 1, y: 0 }}
+                exit={{ opacity: 0, scale: 0.95, y: 10 }}
+                transition={{ duration: 0.2 }}
+                className="w-64 p-4 rounded-2xl border border-white/10 shadow-2xl"
+                style={{ backgroundColor: 'rgba(37, 40, 48, 0.97)', backdropFilter: 'blur(20px)' }}
+              >
+                {updateModal.status === 'available' && (
+                  <>
+                    <div className="flex items-center gap-2.5 mb-2">
+                      <Download size={18} style={{ color: accentColor }} />
+                      <span className="text-sm font-bold text-white">{t.updateAvailable(updateModal.version)}</span>
+                    </div>
+                    <p className="text-[10px] text-white/60 leading-snug mb-4">{t.updateDesc(updateModal.version)}</p>
+                    <div className="flex gap-2">
+                      <button onClick={() => setUpdateModal(null)}
+                        className="flex-1 px-3 py-2 rounded-xl text-[10px] font-bold tracking-wide uppercase border border-white/15 text-white/80 hover:bg-white/10 transition-colors">
+                        {t.later}
+                      </button>
+                      <button onClick={handleDownloadUpdate}
+                        className="flex-1 px-3 py-2 rounded-xl text-[10px] font-bold tracking-wide uppercase transition-transform"
+                        style={{ background: `linear-gradient(to right, ${accentColor}, ${accentColor}cc)`, color: timeOfDay === 'day' ? '#1a1a1a' : '#fff', boxShadow: `0 4px 15px ${accentColor}60` }}>
+                        {t.downloadAndInstall}
+                      </button>
+                    </div>
+                  </>
+                )}
+                {updateModal.status === 'downloading' && (
+                  <div className="flex flex-col items-center py-1">
+                    <Loader2 size={20} className="animate-spin mb-2" style={{ color: accentColor }} />
+                    <span className="text-[11px] font-semibold text-white">{t.downloading(updateModal.progress)}</span>
+                    <div className="w-full h-1.5 rounded-full bg-white/10 mt-3 overflow-hidden">
+                      <motion.div className="h-full rounded-full" style={{ backgroundColor: accentColor }}
+                        animate={{ width: `${updateModal.progress}%` }} transition={{ duration: 0.2 }} />
+                    </div>
+                  </div>
+                )}
+                {updateModal.status === 'installing' && (
+                  <div className="flex flex-col items-center py-1">
+                    <Loader2 size={20} className="animate-spin mb-2" style={{ color: accentColor }} />
+                    <span className="text-[11px] font-semibold text-white">{t.installing}</span>
+                  </div>
+                )}
+                {updateModal.status === 'error' && (
+                  <>
+                    <div className="flex items-center gap-2.5 mb-2">
+                      <AlertCircle size={18} className="text-red-400" />
+                      <span className="text-sm font-bold text-white">{t.updateError}</span>
+                    </div>
+                    <div className="flex gap-2">
+                      <button onClick={() => setUpdateModal(null)}
+                        className="flex-1 px-3 py-2 rounded-xl text-[10px] font-bold tracking-wide uppercase border border-white/15 text-white/80 hover:bg-white/10 transition-colors">
+                        {t.later}
+                      </button>
+                      <button onClick={() => { openUrl('https://github.com/pavel807/TurnOffMachine/releases/latest'); setUpdateModal(null); }}
+                        className="flex-1 px-3 py-2 rounded-xl text-[10px] font-bold tracking-wide uppercase transition-transform"
+                        style={{ background: `linear-gradient(to right, ${accentColor}, ${accentColor}cc)`, color: timeOfDay === 'day' ? '#1a1a1a' : '#fff', boxShadow: `0 4px 15px ${accentColor}60` }}>
+                        {t.openReleases}
+                      </button>
+                    </div>
+                  </>
+                )}
+              </motion.div>
+            </motion.div>
+          )}
+        </AnimatePresence>
 
         {/* Toast */}
         <AnimatePresence>
