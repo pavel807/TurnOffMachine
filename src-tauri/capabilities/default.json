@@ -1,0 +1,23 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "Capability for the main window",
+  "windows": ["main"],
+  "permissions": [
+    "core:default",
+    "core:window:allow-minimize",
+    "core:window:allow-close",
+    "core:window:allow-start-dragging",
+    "core:window:allow-set-focus",
+    {
+      "identifier": "shell:allow-execute",
+      "allow": [
+        { "name": "shutdown", "cmd": "shutdown", "args": true },
+        { "name": "osascript", "cmd": "osascript", "args": true },
+        { "name": "pmset", "cmd": "pmset", "args": true },
+        { "name": "systemctl", "cmd": "systemctl", "args": true },
+        { "name": "rundll32.exe", "cmd": "rundll32.exe", "args": true }
+      ]
+    }
+  ]
+}
