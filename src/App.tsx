@@ -11,10 +11,13 @@ import {
   HardDrive,
   AlertCircle,
   Sun,
-  CloudMoon
+  CloudMoon,
+  Settings,
+  Check
 } from 'lucide-react';
 import { getCurrentWindow } from '@tauri-apps/api/window';
 import { invoke } from '@tauri-apps/api/core';
+import { enable, disable, isEnabled } from '@tauri-apps/plugin-autostart';
 
 // Импорты фонов
 import DaySvg from './assets/day.svg';
@@ -22,7 +25,7 @@ import NightSvg from './assets/night.svg';
 
 // --- Types ---
 type ActionType = 'Shutdown' | 'Restart' | 'Sleep' | 'Hibernate';
-type AppMode = 'loading' | 'idle' | 'counting';
+type AppMode = 'loading' | 'idle' | 'counting' | 'confirming';
 type TimeOfDay = 'day' | 'night';
 
 const ACTION_CONFIG: Record<ActionType, { icon: React.ElementType; label: string }> = {
@@ -94,7 +97,14 @@ const LoadingScreen = ({ onComplete, timeOfDay }: { onComplete: () => void; time
 };
 
 // --- TitleBar ---
-const TitleBar = ({ timeOfDay, onToggleTheme }: { timeOfDay: TimeOfDay; onToggleTheme: () => void }) => {
+interface TitleBarProps {
+  timeOfDay: TimeOfDay;
+  onToggleTheme: () => void;
+  onToggleSettings: () => void;
+  settingsOpen: boolean;
+}
+
+const TitleBar: React.FC<TitleBarProps> = ({ timeOfDay, onToggleTheme, onToggleSettings, settingsOpen }) => {
   const appWindow = getCurrentWindow();
 
   const handleDragStart = (e: React.MouseEvent) => {
@@ -113,6 +123,14 @@ const TitleBar = ({ timeOfDay, onToggleTheme }: { timeOfDay: TimeOfDay; onToggle
         <span className="text-[11px] font-bold tracking-wide uppercase text-white/90 drop-shadow-md">Turn Off Machine</span>
       </div>
       <div className="flex items-center gap-1 relative">
+        <button 
+          onMouseDown={(e) => e.stopPropagation()}
+          onClick={onToggleSettings}
+          className={`w-6 h-6 flex items-center justify-center rounded-full transition-all border border-white/10 ${settingsOpen ? 'bg-white/15 text-white' : 'text-white/70 hover:text-white hover:bg-white/10'}`}
+          title="Settings"
+        >
+          <Settings size={12} strokeWidth={2.5} />
+        </button>
         <button 
           onMouseDown={(e) => e.stopPropagation()}
           onClick={onToggleTheme}
@@ -209,15 +227,94 @@ const TimerBox: React.FC<TimerBoxProps> = ({ label, value, max, onChange, disabl
 interface ToastProps { message: string; type: 'error' | 'success'; onClose: () => void; }
 
 const Toast: React.FC<ToastProps> = ({ message, type, onClose }) => {
-  useEffect(() => { const t = setTimeout(onClose, 4000); return () => clearTimeout(t); }, [onClose]);
+  const onCloseRef = useRef(onClose);
+  useEffect(() => { onCloseRef.current = onClose; });
+  useEffect(() => {
+    const t = setTimeout(() => onCloseRef.current(), 4000);
+    return () => clearTimeout(t);
+  }, []);
   return (
     <motion.div initial={{ opacity: 0, y: 30, scale: 0.9 }} animate={{ opacity: 1, y: 0, scale: 1 }} exit={{ opacity: 0, y: 20, scale: 0.9 }}
-      className={`fixed bottom-4 left-1/2 -translate-x-1/2 z-50 flex items-center gap-2 px-4 py-2 rounded-full border shadow-2xl ${type === 'error' ? 'border-red-500/30 text-red-200' : 'border-green-500/30 text-green-200'}`}
+      className={`fixed bottom-4 left-1/2 -translate-x-1/2 z-50 flex items-center gap-2 pl-4 pr-1.5 py-1.5 rounded-full border shadow-2xl ${type === 'error' ? 'border-red-500/30 text-red-200' : 'border-green-500/30 text-green-200'}`}
       style={{ backgroundColor: type === 'error' ? 'rgba(239,68,68,0.2)' : 'rgba(34,197,94,0.2)', backdropFilter: 'blur(20px)' }}>
       <AlertCircle size={14} /><span className="text-xs font-medium">{message}</span>
+      <button onClick={onClose} className="ml-1 p-1 rounded-full hover:bg-white/10 transition-colors">
+        <X size={11} strokeWidth={3} />
+      </button>
     </motion.div>
   );
 };
+
+// --- SettingsPanel ---
+type BehaviorSettingKey = 'alwaysOnTop' | 'confirmBeforeAction' | 'rememberAction' | 'soundAtEnd';
+
+interface BehaviorSettings {
+  alwaysOnTop: boolean;
+  confirmBeforeAction: boolean;
+  rememberAction: boolean;
+  soundAtEnd: boolean;
+}
+
+const DEFAULT_BEHAVIOR_SETTINGS: BehaviorSettings = {
+  alwaysOnTop: false,
+  confirmBeforeAction: false,
+  rememberAction: false,
+  soundAtEnd: true,
+};
+
+const Switch: React.FC<{ on: boolean; accent: string; onClick: () => void }> = ({ on, accent, onClick }) => (
+  <button
+    onClick={onClick}
+    className={`relative shrink-0 w-9 h-5 rounded-full transition-all duration-200 ${on ? '' : 'bg-white/15'}`}
+    style={on ? { backgroundColor: accent, boxShadow: `0 0 10px ${accent}66` } : {}}
+  >
+    <span className={`absolute top-0.5 w-4 h-4 rounded-full bg-white shadow transition-all duration-200 ${on ? 'left-[18px]' : 'left-0.5'}`} />
+  </button>
+);
+
+const SettingRow: React.FC<{ title: string; sub: string; on: boolean; accent: string; onToggle: () => void }> = ({ title, sub, on, accent, onToggle }) => (
+  <div className="flex items-center justify-between gap-3 py-2">
+    <div className="flex flex-col gap-0.5">
+      <span className="text-[11px] font-semibold text-white leading-none">{title}</span>
+      <span className="text-[9px] text-white/50 leading-tight mt-0.5">{sub}</span>
+    </div>
+    <Switch on={on} accent={accent} onClick={onToggle} />
+  </div>
+);
+
+interface SettingsPanelProps {
+  autoStart: boolean;
+  settings: BehaviorSettings;
+  onToggleAutoStart: () => void;
+  onToggleSetting: (key: BehaviorSettingKey) => void;
+  accent: string;
+}
+
+const SettingsPanel: React.FC<SettingsPanelProps> = ({ autoStart, settings, onToggleAutoStart, onToggleSetting, accent }) => (
+  <motion.div
+    initial={{ opacity: 0, y: -8, scale: 0.96 }}
+    animate={{ opacity: 1, y: 0, scale: 1 }}
+    exit={{ opacity: 0, y: -8, scale: 0.96 }}
+    transition={{ duration: 0.15 }}
+    className="w-64 rounded-2xl border border-white/10 shadow-2xl p-3.5 max-h-[calc(100vh-120px)] overflow-y-auto"
+    style={{ backgroundColor: 'rgba(37,40,48,0.97)', backdropFilter: 'blur(20px)' }}
+  >
+    <p className="text-[9px] font-bold tracking-widest uppercase text-white/50 mb-1 flex items-center gap-1.5">
+      <Settings size={10} /> Settings
+    </p>
+    <SettingRow title="Launch at login" sub="Start automatically with your system"
+      on={autoStart} accent={accent} onToggle={onToggleAutoStart} />
+    <div className="h-px bg-white/10 my-1" />
+    <SettingRow title="Always on top" sub="Keep the window above others"
+      on={settings.alwaysOnTop} accent={accent} onToggle={() => onToggleSetting('alwaysOnTop')} />
+    <SettingRow title="Confirm before action" sub="Ask before performing the action"
+      on={settings.confirmBeforeAction} accent={accent} onToggle={() => onToggleSetting('confirmBeforeAction')} />
+    <SettingRow title="Remember last action" sub="Restore your last choice on launch"
+      on={settings.rememberAction} accent={accent} onToggle={() => onToggleSetting('rememberAction')} />
+    <SettingRow title="Sound at end" sub="Play a sound when the timer ends"
+      on={settings.soundAtEnd} accent={accent} onToggle={() => onToggleSetting('soundAtEnd')} />
+  </motion.div>
+);
 
 // --- Main App ---
 export default function App() {
@@ -229,7 +326,12 @@ export default function App() {
   const [toast, setToast] = useState<{ message: string; type: 'error' | 'success' } | null>(null);
   const [currentDate, setCurrentDate] = useState('');
   const [manualOverride, setManualOverride] = useState<TimeOfDay | null>(null);
+  const [autoStart, setAutoStart] = useState(false);
+  const [settingsOpen, setSettingsOpen] = useState(false);
+  const [settings, setSettings] = useState<BehaviorSettings>(DEFAULT_BEHAVIOR_SETTINGS);
+  const [confirming, setConfirming] = useState(false);
   const dropRef = useRef<HTMLDivElement>(null);
+  const settingsRef = useRef<HTMLDivElement>(null);
 
   // Авто-определение времени суток
   const autoTimeOfDay: TimeOfDay = useMemo(() => {
@@ -256,20 +358,77 @@ export default function App() {
   useEffect(() => {
     const handler = (e: MouseEvent) => {
       if (dropRef.current && !dropRef.current.contains(e.target as Node)) setIsOpen(false);
+      if (settingsRef.current && !settingsRef.current.contains(e.target as Node)) setSettingsOpen(false);
     };
     document.addEventListener('mousedown', handler);
     return () => document.removeEventListener('mousedown', handler);
   }, []);
 
   useEffect(() => {
-    let interval: ReturnType<typeof setInterval>;
-    if (mode === 'counting' && timeLeft > 0) {
-      interval = setInterval(() => setTimeLeft((prev) => prev - 1), 1000);
-    } else if (mode === 'counting' && timeLeft === 0) {
-      executeAction();
+    isEnabled().then(setAutoStart).catch(() => {});
+  }, []);
+
+  useEffect(() => {
+    try {
+      const raw = localStorage.getItem('settings');
+      if (raw) setSettings({ ...DEFAULT_BEHAVIOR_SETTINGS, ...JSON.parse(raw) });
+    } catch (e) { console.warn('Failed to load settings:', e); }
+  }, []);
+
+  useEffect(() => {
+    try {
+      const saved = localStorage.getItem('selectedAction');
+      if (saved && saved in ACTION_CONFIG) setAction(saved as ActionType);
+    } catch (e) { console.warn('Failed to load action:', e); }
+  }, []);
+
+  useEffect(() => {
+    getCurrentWindow().setAlwaysOnTop(settings.alwaysOnTop).catch(() => {});
+  }, [settings.alwaysOnTop]);
+
+  const updateSetting = (key: BehaviorSettingKey) => {
+    setSettings(prev => {
+      const next = { ...prev, [key]: !prev[key] };
+      try { localStorage.setItem('settings', JSON.stringify(next)); } catch (e) { console.warn(e); }
+      return next;
+    });
+  };
+
+  const toggleAutoStart = async () => {
+    try {
+      if (autoStart) {
+        await disable();
+      } else {
+        await enable();
+      }
+      setAutoStart(!autoStart);
+      setToast({ message: `Launch at login ${!autoStart ? 'enabled' : 'disabled'}.`, type: 'success' });
+    } catch (e) {
+      console.error('Autostart change failed:', e);
+      setToast({ message: 'Failed to change autostart. Run the built app.', type: 'error' });
     }
-    return () => clearInterval(interval);
-  }, [mode, timeLeft, action]);
+  };
+
+  const playEndSound = useCallback(() => {
+    if (!settings.soundAtEnd) return;
+    try {
+      const ctx = new AudioContext();
+      [0, 0.35, 0.7].forEach((t, i) => {
+        const osc = ctx.createOscillator();
+        const gain = ctx.createGain();
+        osc.connect(gain);
+        gain.connect(ctx.destination);
+        osc.frequency.value = i === 2 ? 1046.5 : 784;
+        osc.type = 'sine';
+        gain.gain.setValueAtTime(0.0001, ctx.currentTime + t);
+        gain.gain.exponentialRampToValueAtTime(0.4, ctx.currentTime + t + 0.02);
+        gain.gain.exponentialRampToValueAtTime(0.0001, ctx.currentTime + t + 0.28);
+        osc.start(ctx.currentTime + t);
+        osc.stop(ctx.currentTime + t + 0.32);
+      });
+      setTimeout(() => ctx.close(), 1500);
+    } catch (e) { console.warn('Sound failed:', e); }
+  }, [settings.soundAtEnd]);
 
   const executeAction = useCallback(async () => {
     try {
@@ -281,6 +440,23 @@ export default function App() {
       setMode('idle');
     }
   }, [action]);
+
+  useEffect(() => {
+    let interval: ReturnType<typeof setInterval>;
+    if (mode === 'counting' && timeLeft > 0) {
+      interval = setInterval(() => setTimeLeft((prev) => prev - 1), 1000);
+    } else if (mode === 'counting' && timeLeft === 0) {
+      if (settings.confirmBeforeAction) {
+        playEndSound();
+        setMode('confirming');
+        setConfirming(true);
+      } else {
+        playEndSound();
+        executeAction();
+      }
+    }
+    return () => clearInterval(interval);
+  }, [mode, timeLeft, action, settings.confirmBeforeAction, playEndSound, executeAction]);
 
   const handleStart = async () => {
     const totalSeconds = timer.h * 3600 + timer.m * 60 + timer.s;
@@ -296,8 +472,29 @@ export default function App() {
   const handleCancel = async () => {
     try { await invoke('cancel_power_action'); } catch (e) { console.warn(e); }
     setMode('idle');
+    setConfirming(false);
     setTimeLeft(0);
     setToast({ message: 'Timer cancelled.', type: 'success' });
+  };
+
+  const handleConfirmAction = async () => {
+    setConfirming(false);
+    await executeAction();
+  };
+
+  const handleDenyAction = () => {
+    setConfirming(false);
+    setMode('idle');
+    setTimeLeft(0);
+    setToast({ message: 'Action cancelled.', type: 'success' });
+  };
+
+  const selectAction = (a: ActionType) => {
+    setAction(a);
+    setIsOpen(false);
+    if (settings.rememberAction) {
+      try { localStorage.setItem('selectedAction', a); } catch (e) { console.warn(e); }
+    }
   };
 
   const formatTime = (seconds: number) => {
@@ -340,7 +537,55 @@ export default function App() {
                style={{ background: `linear-gradient(to top, ${bgColor}, transparent)` }} />
         </div>
 
-        <TitleBar timeOfDay={timeOfDay} onToggleTheme={toggleTheme} />
+        <TitleBar timeOfDay={timeOfDay} onToggleTheme={toggleTheme} onToggleSettings={() => setSettingsOpen(o => !o)} settingsOpen={settingsOpen} />
+
+        {/* Settings */}
+        <div ref={settingsRef} className="absolute top-12 right-3 z-40 pointer-events-auto">
+          <AnimatePresence>
+            {settingsOpen && (
+              <SettingsPanel autoStart={autoStart} settings={settings} onToggleAutoStart={toggleAutoStart} onToggleSetting={updateSetting} accent={accentColor} />
+            )}
+          </AnimatePresence>
+        </div>
+
+        {/* Confirm before action */}
+        <AnimatePresence>
+          {confirming && (
+            <motion.div
+              initial={{ opacity: 0 }}
+              animate={{ opacity: 1 }}
+              exit={{ opacity: 0 }}
+              className="absolute inset-0 z-40 flex items-center justify-center rounded-[2.5rem]"
+              style={{ backgroundColor: 'rgba(10, 11, 14, 0.6)', backdropFilter: 'blur(8px)' }}
+            >
+              <motion.div
+                initial={{ opacity: 0, scale: 0.9, y: 10 }}
+                animate={{ opacity: 1, scale: 1, y: 0 }}
+                exit={{ opacity: 0, scale: 0.95, y: 10 }}
+                transition={{ duration: 0.2 }}
+                className="w-64 p-4 rounded-2xl border border-white/10 shadow-2xl"
+                style={{ backgroundColor: 'rgba(37, 40, 48, 0.97)', backdropFilter: 'blur(20px)' }}
+              >
+                <div className="flex items-center gap-2.5 mb-2">
+                  <CurrentIcon size={18} style={{ color: accentColor }} />
+                  <span className="text-sm font-bold text-white">{ACTION_CONFIG[action].label} now?</span>
+                </div>
+                <p className="text-[10px] text-white/60 leading-snug mb-4">The timer has finished. Do you want to {ACTION_CONFIG[action].label.toLowerCase()} your computer now?</p>
+                <div className="flex gap-2">
+                  <button onClick={handleDenyAction}
+                    className="flex-1 px-3 py-2 rounded-xl text-[10px] font-bold tracking-wide uppercase border border-white/15 text-white/80 hover:bg-white/10 transition-colors">
+                    Cancel
+                  </button>
+                  <button onClick={handleConfirmAction}
+                    className="flex-1 px-3 py-2 rounded-xl text-[10px] font-bold tracking-wide uppercase transition-transform"
+                    style={{ background: `linear-gradient(to right, ${accentColor}, ${accentColor}cc)`, color: timeOfDay === 'day' ? '#1a1a1a' : '#fff', boxShadow: `0 4px 15px ${accentColor}60` }}>
+                    Yes
+                  </button>
+                </div>
+              </motion.div>
+            </motion.div>
+          )}
+        </AnimatePresence>
 
         <div className="relative z-10 flex flex-col items-center justify-between py-11 px-5 h-full">
           
@@ -355,10 +600,10 @@ export default function App() {
             <motion.div
               whileHover={mode === 'idle' ? { scale: 1.15, filter: `drop-shadow(0 0 15px ${accentColor})` } : {}}
               whileTap={mode === 'idle' ? { scale: 0.9 } : {}}
-              onClick={mode === 'counting' ? handleCancel : undefined}
-              className={`cursor-pointer mb-2 p-3 rounded-full transition-all duration-300 ${mode === 'counting' ? 'bg-red-500/20 hover:bg-red-500/30 animate-pulse' : 'hover:bg-white/5'}`}
+              onClick={mode === 'counting' || mode === 'confirming' ? handleCancel : undefined}
+              className={`cursor-pointer mb-2 p-3 rounded-full transition-all duration-300 ${mode === 'counting' || mode === 'confirming' ? 'bg-red-500/20 hover:bg-red-500/30 animate-pulse' : 'hover:bg-white/5'}`}
             >
-              <Power size={34} strokeWidth={1.8} className={`drop-shadow-lg transition-colors duration-300 ${mode === 'counting' ? 'text-red-400' : 'text-white'}`} />
+              <Power size={34} strokeWidth={1.8} className={`drop-shadow-lg transition-colors duration-300 ${mode === 'counting' || mode === 'confirming' ? 'text-red-400' : 'text-white'}`} />
             </motion.div>
             
             <p className="text-[11px] text-white/70 font-bold tracking-wide drop-shadow-md mb-3 h-4">
@@ -393,12 +638,14 @@ export default function App() {
                         const Icon = ACTION_CONFIG[key].icon;
                         const isActive = action === key;
                         return (
-                          <button key={key} onClick={() => { setAction(key); setIsOpen(false); }}
-                            className="w-full flex items-center gap-2 px-3 py-2 text-[11px] transition-colors"
+                          <button key={key} onClick={() => selectAction(key)}
+                            className="w-full flex items-center gap-2 px-3 py-2 text-[11px] transition-colors hover:bg-white/5"
                             style={isActive 
                               ? { backgroundColor: `${accentColor}20`, color: accentColor } 
                               : { color: 'rgba(255,255,255,0.7)' }}>
-                            <Icon size={13} /><span className="font-bold">{ACTION_CONFIG[key].label}</span>
+                            <Icon size={13} />
+                            <span className="font-bold flex-1 text-left">{ACTION_CONFIG[key].label}</span>
+                            {isActive && <Check size={12} strokeWidth={3} />}
                           </button>
                         );
                       })}
