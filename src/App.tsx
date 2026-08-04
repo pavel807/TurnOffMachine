@@ -27,16 +27,136 @@ import NightSvg from './assets/night.svg';
 type ActionType = 'Shutdown' | 'Restart' | 'Sleep' | 'Hibernate';
 type AppMode = 'loading' | 'idle' | 'counting' | 'confirming';
 type TimeOfDay = 'day' | 'night';
+type Lang = 'en' | 'ru';
 
-const ACTION_CONFIG: Record<ActionType, { icon: React.ElementType; label: string }> = {
-  Shutdown: { icon: Power, label: 'Shutdown' },
-  Restart: { icon: RotateCcw, label: 'Restart' },
-  Sleep: { icon: Moon, label: 'Sleep' },
-  Hibernate: { icon: HardDrive, label: 'Hibernate' },
+const ACTION_CONFIG: Record<ActionType, { icon: React.ElementType; label: Record<Lang, string>; verb: Record<Lang, string> }> = {
+  Shutdown: { icon: Power, label: { en: 'Shutdown', ru: 'Выключение' }, verb: { en: 'shutdown', ru: 'выключить' } },
+  Restart: { icon: RotateCcw, label: { en: 'Restart', ru: 'Перезагрузка' }, verb: { en: 'restart', ru: 'перезагрузить' } },
+  Sleep: { icon: Moon, label: { en: 'Sleep', ru: 'Сон' }, verb: { en: 'sleep', ru: 'перевести в сон' } },
+  Hibernate: { icon: HardDrive, label: { en: 'Hibernate', ru: 'Гибернация' }, verb: { en: 'hibernate', ru: 'перевести в гибернацию' } },
+};
+
+// --- I18n ---
+interface I18n {
+  greetingMorning: string;
+  greetingAfternoon: string;
+  greetingEvening: string;
+  loading: string;
+  toggleTheme: string;
+  selectAction: string;
+  executingIn: (time: string) => string;
+  actionLabel: string;
+  hours: string;
+  minutes: string;
+  seconds: string;
+  startNow: string;
+  cancelTimer: string;
+  timerStarted: (action: string, time: string) => string;
+  timerCancelled: string;
+  actionCancelled: string;
+  permissionDenied: string;
+  settings: string;
+  launchAtLogin: string;
+  launchAtLoginSub: string;
+  alwaysOnTop: string;
+  alwaysOnTopSub: string;
+  confirmBeforeAction: string;
+  confirmBeforeActionSub: string;
+  rememberLastAction: string;
+  rememberLastActionSub: string;
+  soundAtEnd: string;
+  soundAtEndSub: string;
+  language: string;
+  confirmTitle: (action: string) => string;
+  confirmDesc: (action: string) => string;
+  cancel: string;
+  yes: string;
+  autostartEnabled: string;
+  autostartDisabled: string;
+  autostartFailed: string;
+}
+
+const T: Record<Lang, I18n> = {
+  en: {
+    greetingMorning: 'Good morning!',
+    greetingAfternoon: 'Good afternoon!',
+    greetingEvening: 'Good evening!',
+    loading: 'loading...',
+    toggleTheme: 'Toggle Day/Night',
+    selectAction: 'select an action below:',
+    executingIn: (time) => `executing in ${time}...`,
+    actionLabel: 'action:',
+    hours: 'hours',
+    minutes: 'minutes',
+    seconds: 'seconds',
+    startNow: 'Start Now',
+    cancelTimer: 'Cancel Timer',
+    timerStarted: (action, time) => `Timer started. ${action} in ${time}.`,
+    timerCancelled: 'Timer cancelled.',
+    actionCancelled: 'Action cancelled.',
+    permissionDenied: 'Permission denied. Check OS settings.',
+    settings: 'Settings',
+    launchAtLogin: 'Launch at login',
+    launchAtLoginSub: 'Start automatically with your system',
+    alwaysOnTop: 'Always on top',
+    alwaysOnTopSub: 'Keep the window above others',
+    confirmBeforeAction: 'Confirm before action',
+    confirmBeforeActionSub: 'Ask before performing the action',
+    rememberLastAction: 'Remember last action',
+    rememberLastActionSub: 'Restore your last choice on launch',
+    soundAtEnd: 'Sound at end',
+    soundAtEndSub: 'Play a sound when the timer ends',
+    language: 'Language',
+    confirmTitle: (action) => `${action} now?`,
+    confirmDesc: (action) => `The timer has finished. Do you want to ${action} your computer now?`,
+    cancel: 'Cancel',
+    yes: 'Yes',
+    autostartEnabled: 'Launch at login enabled.',
+    autostartDisabled: 'Launch at login disabled.',
+    autostartFailed: 'Failed to change autostart. Run the built app.',
+  },
+  ru: {
+    greetingMorning: 'Доброе утро!',
+    greetingAfternoon: 'Добрый день!',
+    greetingEvening: 'Добрый вечер!',
+    loading: 'загрузка...',
+    toggleTheme: 'День/Ночь',
+    selectAction: 'выберите действие ниже:',
+    executingIn: (time) => `выполнение через ${time}...`,
+    actionLabel: 'действие:',
+    hours: 'часы',
+    minutes: 'минуты',
+    seconds: 'секунды',
+    startNow: 'Старт',
+    cancelTimer: 'Отмена',
+    timerStarted: (action, time) => `Таймер запущен. ${action} через ${time}.`,
+    timerCancelled: 'Таймер отменён.',
+    actionCancelled: 'Действие отменено.',
+    permissionDenied: 'Доступ запрещён. Проверьте настройки ОС.',
+    settings: 'Настройки',
+    launchAtLogin: 'Запуск при входе',
+    launchAtLoginSub: 'Автоматический запуск с системой',
+    alwaysOnTop: 'Поверх всех окон',
+    alwaysOnTopSub: 'Окно всегда поверх других окон',
+    confirmBeforeAction: 'Подтверждать действие',
+    confirmBeforeActionSub: 'Спрашивать перед выполнением действия',
+    rememberLastAction: 'Запоминать действие',
+    rememberLastActionSub: 'Восстанавливать выбор при запуске',
+    soundAtEnd: 'Звук по окончании',
+    soundAtEndSub: 'Сигнал, когда таймер закончится',
+    language: 'Язык',
+    confirmTitle: (action) => `${action.charAt(0).toUpperCase()}${action.slice(1)} сейчас?`,
+    confirmDesc: (action) => `Таймер завершён. ${action.charAt(0).toUpperCase()}${action.slice(1)} компьютер сейчас?`,
+    cancel: 'Отмена',
+    yes: 'Да',
+    autostartEnabled: 'Автозапуск включён.',
+    autostartDisabled: 'Автозапуск выключен.',
+    autostartFailed: 'Не удалось изменить автозапуск. Запустите собранное приложение.',
+  },
 };
 
 // --- Loading Screen ---
-const LoadingScreen = ({ onComplete, timeOfDay }: { onComplete: () => void; timeOfDay: TimeOfDay }) => {
+const LoadingScreen = ({ onComplete, timeOfDay, lang }: { onComplete: () => void; timeOfDay: TimeOfDay; lang: Lang }) => {
   const [progress, setProgress] = useState(0);
 
   useEffect(() => {
@@ -53,11 +173,12 @@ const LoadingScreen = ({ onComplete, timeOfDay }: { onComplete: () => void; time
     return () => clearInterval(interval);
   }, [onComplete]);
 
+  const t = T[lang];
   const getGreeting = () => {
     const hour = new Date().getHours();
-    if (hour < 12) return 'Good morning!';
-    if (hour < 18) return 'Good afternoon!';
-    return 'Good evening!';
+    if (hour < 12) return t.greetingMorning;
+    if (hour < 18) return t.greetingAfternoon;
+    return t.greetingEvening;
   };
 
   const radius = 120;
@@ -66,30 +187,32 @@ const LoadingScreen = ({ onComplete, timeOfDay }: { onComplete: () => void; time
   const accent = timeOfDay === 'day' ? '#f5a623' : '#a78bfa';
 
   return (
-    <motion.div 
+    <motion.div
       initial={{ opacity: 1 }}
       exit={{ opacity: 0, scale: 1.05 }}
       transition={{ duration: 0.6 }}
       className="absolute inset-0 z-50 flex items-center justify-center rounded-[2.5rem]"
-      style={{ backgroundColor: 'rgba(30, 33, 40, 0.95)', backdropFilter: 'blur(20px)' }}
     >
-      <div className="relative w-64 h-64 flex items-center justify-center">
-        <svg className="absolute inset-0 w-full h-full -rotate-90">
-          <circle cx="128" cy="128" r={radius} fill="rgba(42, 45, 53, 0.8)" stroke="rgba(255,255,255,0.08)" strokeWidth="8"/>
-          <motion.circle
-            cx="128" cy="128" r={radius} fill="none"
-            stroke={accent}
-            strokeWidth="8" strokeLinecap="round"
-            strokeDasharray={circumference}
-            animate={{ strokeDashoffset: offset }}
-            transition={{ duration: 0.15, ease: "easeOut" }}
-          />
-        </svg>
-        <div className="relative z-10 flex flex-col items-center text-white">
-          <Power size={36} strokeWidth={2} className="mb-3 drop-shadow-lg" style={{ color: accent }} />
-          <span className="text-5xl font-bold tabular-nums tracking-tighter">{Math.min(progress, 100)}%</span>
-          <span className="text-sm font-semibold mt-2 opacity-80">{getGreeting()}</span>
-          <span className="text-xs opacity-50 mt-1 animate-pulse">loading...</span>
+      <div className="relative flex items-center justify-center">
+        <div className="absolute rounded-full border border-white/10"
+          style={{ width: 288, height: 288, backgroundColor: 'rgba(24, 26, 32, 0.9)', backdropFilter: 'blur(20px)', boxShadow: '0 20px 50px -10px rgba(0,0,0,0.6)' }} />
+        <div className="relative w-64 h-64 flex items-center justify-center">
+          <svg className="absolute inset-0 w-full h-full -rotate-90">
+            <motion.circle
+              cx="128" cy="128" r={radius} fill="none"
+              stroke={accent}
+              strokeWidth="8" strokeLinecap="round"
+              strokeDasharray={circumference}
+              animate={{ strokeDashoffset: offset }}
+              transition={{ duration: 0.15, ease: "easeOut" }}
+            />
+          </svg>
+          <div className="relative z-10 flex flex-col items-center text-white drop-shadow-[0_2px_8px_rgba(0,0,0,0.9)]">
+            <Power size={36} strokeWidth={2} className="mb-3" style={{ color: accent }} />
+            <span className="text-5xl font-bold tabular-nums tracking-tighter">{Math.min(progress, 100)}%</span>
+            <span className="text-sm font-semibold mt-2 opacity-90">{getGreeting()}</span>
+            <span className="text-xs opacity-60 mt-1 animate-pulse">{t.loading}</span>
+          </div>
         </div>
       </div>
     </motion.div>
@@ -102,9 +225,10 @@ interface TitleBarProps {
   onToggleTheme: () => void;
   onToggleSettings: () => void;
   settingsOpen: boolean;
+  t: I18n;
 }
 
-const TitleBar: React.FC<TitleBarProps> = ({ timeOfDay, onToggleTheme, onToggleSettings, settingsOpen }) => {
+const TitleBar: React.FC<TitleBarProps> = ({ timeOfDay, onToggleTheme, onToggleSettings, settingsOpen, t }) => {
   const appWindow = getCurrentWindow();
 
   const handleDragStart = (e: React.MouseEvent) => {
@@ -127,7 +251,7 @@ const TitleBar: React.FC<TitleBarProps> = ({ timeOfDay, onToggleTheme, onToggleS
           onMouseDown={(e) => e.stopPropagation()}
           onClick={onToggleSettings}
           className={`w-6 h-6 flex items-center justify-center rounded-full transition-all border border-white/10 ${settingsOpen ? 'bg-white/15 text-white' : 'text-white/70 hover:text-white hover:bg-white/10'}`}
-          title="Settings"
+          title={t.settings}
         >
           <Settings size={12} strokeWidth={2.5} />
         </button>
@@ -135,7 +259,7 @@ const TitleBar: React.FC<TitleBarProps> = ({ timeOfDay, onToggleTheme, onToggleS
           onMouseDown={(e) => e.stopPropagation()}
           onClick={onToggleTheme}
           className="w-6 h-6 flex items-center justify-center text-white/70 hover:text-white hover:bg-white/10 rounded-full transition-all border border-white/10"
-          title="Toggle Day/Night"
+          title={t.toggleTheme}
         >
           {timeOfDay === 'day' ? <Sun size={12} strokeWidth={2.5} /> : <CloudMoon size={12} strokeWidth={2.5} />}
         </button>
@@ -288,9 +412,12 @@ interface SettingsPanelProps {
   onToggleAutoStart: () => void;
   onToggleSetting: (key: BehaviorSettingKey) => void;
   accent: string;
+  lang: Lang;
+  onLangChange: (l: Lang) => void;
+  t: I18n;
 }
 
-const SettingsPanel: React.FC<SettingsPanelProps> = ({ autoStart, settings, onToggleAutoStart, onToggleSetting, accent }) => (
+const SettingsPanel: React.FC<SettingsPanelProps> = ({ autoStart, settings, onToggleAutoStart, onToggleSetting, accent, lang, onLangChange, t }) => (
   <motion.div
     initial={{ opacity: 0, y: -8, scale: 0.96 }}
     animate={{ opacity: 1, y: 0, scale: 1 }}
@@ -300,19 +427,32 @@ const SettingsPanel: React.FC<SettingsPanelProps> = ({ autoStart, settings, onTo
     style={{ backgroundColor: 'rgba(37,40,48,0.97)', backdropFilter: 'blur(20px)' }}
   >
     <p className="text-[9px] font-bold tracking-widest uppercase text-white/50 mb-1 flex items-center gap-1.5">
-      <Settings size={10} /> Settings
+      <Settings size={10} /> {t.settings}
     </p>
-    <SettingRow title="Launch at login" sub="Start automatically with your system"
+    <SettingRow title={t.launchAtLogin} sub={t.launchAtLoginSub}
       on={autoStart} accent={accent} onToggle={onToggleAutoStart} />
     <div className="h-px bg-white/10 my-1" />
-    <SettingRow title="Always on top" sub="Keep the window above others"
+    <SettingRow title={t.alwaysOnTop} sub={t.alwaysOnTopSub}
       on={settings.alwaysOnTop} accent={accent} onToggle={() => onToggleSetting('alwaysOnTop')} />
-    <SettingRow title="Confirm before action" sub="Ask before performing the action"
+    <SettingRow title={t.confirmBeforeAction} sub={t.confirmBeforeActionSub}
       on={settings.confirmBeforeAction} accent={accent} onToggle={() => onToggleSetting('confirmBeforeAction')} />
-    <SettingRow title="Remember last action" sub="Restore your last choice on launch"
+    <SettingRow title={t.rememberLastAction} sub={t.rememberLastActionSub}
       on={settings.rememberAction} accent={accent} onToggle={() => onToggleSetting('rememberAction')} />
-    <SettingRow title="Sound at end" sub="Play a sound when the timer ends"
+    <SettingRow title={t.soundAtEnd} sub={t.soundAtEndSub}
       on={settings.soundAtEnd} accent={accent} onToggle={() => onToggleSetting('soundAtEnd')} />
+    <div className="h-px bg-white/10 my-1" />
+    <div className="flex items-center justify-between gap-3 py-2">
+      <span className="text-[11px] font-semibold text-white leading-none">{t.language}</span>
+      <div className="flex rounded-full border border-white/10 overflow-hidden">
+        {(['en', 'ru'] as Lang[]).map((l) => (
+          <button key={l} onClick={() => onLangChange(l)}
+            className={`px-2.5 py-1 text-[9px] font-bold tracking-widest uppercase transition-colors ${lang === l ? 'text-white' : 'text-white/50 hover:text-white/80'}`}
+            style={lang === l ? { backgroundColor: accent } : {}}>
+            {l === 'en' ? 'EN' : 'RU'}
+          </button>
+        ))}
+      </div>
+    </div>
   </motion.div>
 );
 
@@ -330,8 +470,20 @@ export default function App() {
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [settings, setSettings] = useState<BehaviorSettings>(DEFAULT_BEHAVIOR_SETTINGS);
   const [confirming, setConfirming] = useState(false);
+  const [lang, setLang] = useState<Lang>(() => {
+    try { return (localStorage.getItem('lang') as Lang) || 'en'; } catch { return 'en'; }
+  });
   const dropRef = useRef<HTMLDivElement>(null);
   const settingsRef = useRef<HTMLDivElement>(null);
+
+  const t = T[lang];
+  const actionLabel = ACTION_CONFIG[action].label[lang];
+  const actionVerb = ACTION_CONFIG[action].verb[lang];
+
+  const changeLang = (l: Lang) => {
+    setLang(l);
+    try { localStorage.setItem('lang', l); } catch (e) { console.warn(e); }
+  };
 
   // Авто-определение времени суток
   const autoTimeOfDay: TimeOfDay = useMemo(() => {
@@ -402,10 +554,10 @@ export default function App() {
         await enable();
       }
       setAutoStart(!autoStart);
-      setToast({ message: `Launch at login ${!autoStart ? 'enabled' : 'disabled'}.`, type: 'success' });
+      setToast({ message: !autoStart ? t.autostartEnabled : t.autostartDisabled, type: 'success' });
     } catch (e) {
       console.error('Autostart change failed:', e);
-      setToast({ message: 'Failed to change autostart. Run the built app.', type: 'error' });
+      setToast({ message: t.autostartFailed, type: 'error' });
     }
   };
 
@@ -436,10 +588,10 @@ export default function App() {
       await getCurrentWindow().close();
     } catch (error) {
       console.error('Power action failed:', error);
-      setToast({ message: `Permission denied. Check OS settings.`, type: 'error' });
+      setToast({ message: t.permissionDenied, type: 'error' });
       setMode('idle');
     }
-  }, [action]);
+  }, [action, t]);
 
   useEffect(() => {
     let interval: ReturnType<typeof setInterval>;
@@ -465,7 +617,7 @@ export default function App() {
     } else {
       setTimeLeft(totalSeconds);
       setMode('counting');
-      setToast({ message: `Timer started. ${action} in ${formatTime(totalSeconds)}.`, type: 'success' });
+      setToast({ message: t.timerStarted(actionLabel, formatTime(totalSeconds)), type: 'success' });
     }
   };
 
@@ -474,7 +626,7 @@ export default function App() {
     setMode('idle');
     setConfirming(false);
     setTimeLeft(0);
-    setToast({ message: 'Timer cancelled.', type: 'success' });
+    setToast({ message: t.timerCancelled, type: 'success' });
   };
 
   const handleConfirmAction = async () => {
@@ -486,7 +638,7 @@ export default function App() {
     setConfirming(false);
     setMode('idle');
     setTimeLeft(0);
-    setToast({ message: 'Action cancelled.', type: 'success' });
+    setToast({ message: t.actionCancelled, type: 'success' });
   };
 
   const selectAction = (a: ActionType) => {
@@ -501,6 +653,9 @@ export default function App() {
     const h = Math.floor(seconds / 3600);
     const m = Math.floor((seconds % 3600) / 60);
     const s = seconds % 60;
+    if (lang === 'ru') {
+      return `${h > 0 ? h + 'ч ' : ''}${m > 0 ? m + 'м ' : ''}${s}с`;
+    }
     return `${h > 0 ? h + 'h ' : ''}${m > 0 ? m + 'm ' : ''}${s}s`;
   };
 
@@ -510,14 +665,15 @@ export default function App() {
 
   return (
     <div className="w-screen h-screen flex items-center justify-center" style={{ background: 'transparent' }}>
-      <div className="relative w-112.5 h-187.5 rounded-[2.5rem] overflow-hidden border border-white/10"
-           style={{ backgroundColor: bgColor, boxShadow: '0 25px 60px -10px rgba(0,0,0,0.5)', zoom: 0.8333 }}>
+      <div className={`relative w-112.5 h-187.5 rounded-[2.5rem] overflow-hidden ${mode === 'loading' ? 'border-transparent' : 'border border-white/10'}`}
+           style={{ backgroundColor: mode === 'loading' ? 'transparent' : bgColor, boxShadow: '0 25px 60px -10px rgba(0,0,0,0.5)', zoom: 0.8333 }}>
         
-        {/* Loading */}
+        {/* Loading — пока идёт загрузка, интерфейс скрыт, окно прозрачное (виден рабочий стол) */}
         <AnimatePresence>
-          {mode === 'loading' && <LoadingScreen onComplete={() => setMode('idle')} timeOfDay={timeOfDay} />}
+          {mode === 'loading' && <LoadingScreen onComplete={() => setMode('idle')} timeOfDay={timeOfDay} lang={lang} />}
         </AnimatePresence>
 
+        {mode !== 'loading' && (<>
         {/* Background — используем img для обоих SVG, они растянутся на всю ширину */}
         <div className="absolute -top-5 left-0 w-full h-[55%] z-0 pointer-events-none overflow-hidden rounded-t-[2.5rem]">
           <AnimatePresence mode="wait">
@@ -537,13 +693,13 @@ export default function App() {
                style={{ background: `linear-gradient(to top, ${bgColor}, transparent)` }} />
         </div>
 
-        <TitleBar timeOfDay={timeOfDay} onToggleTheme={toggleTheme} onToggleSettings={() => setSettingsOpen(o => !o)} settingsOpen={settingsOpen} />
+        <TitleBar timeOfDay={timeOfDay} onToggleTheme={toggleTheme} onToggleSettings={() => setSettingsOpen(o => !o)} settingsOpen={settingsOpen} t={t} />
 
         {/* Settings */}
         <div ref={settingsRef} className="absolute top-12 right-3 z-40 pointer-events-auto">
           <AnimatePresence>
             {settingsOpen && (
-              <SettingsPanel autoStart={autoStart} settings={settings} onToggleAutoStart={toggleAutoStart} onToggleSetting={updateSetting} accent={accentColor} />
+              <SettingsPanel autoStart={autoStart} settings={settings} onToggleAutoStart={toggleAutoStart} onToggleSetting={updateSetting} accent={accentColor} lang={lang} onLangChange={changeLang} t={t} />
             )}
           </AnimatePresence>
         </div>
@@ -568,18 +724,18 @@ export default function App() {
               >
                 <div className="flex items-center gap-2.5 mb-2">
                   <CurrentIcon size={18} style={{ color: accentColor }} />
-                  <span className="text-sm font-bold text-white">{ACTION_CONFIG[action].label} now?</span>
+                  <span className="text-sm font-bold text-white">{t.confirmTitle(lang === 'en' ? actionLabel : actionVerb)}</span>
                 </div>
-                <p className="text-[10px] text-white/60 leading-snug mb-4">The timer has finished. Do you want to {ACTION_CONFIG[action].label.toLowerCase()} your computer now?</p>
+                <p className="text-[10px] text-white/60 leading-snug mb-4">{t.confirmDesc(actionVerb)}</p>
                 <div className="flex gap-2">
                   <button onClick={handleDenyAction}
                     className="flex-1 px-3 py-2 rounded-xl text-[10px] font-bold tracking-wide uppercase border border-white/15 text-white/80 hover:bg-white/10 transition-colors">
-                    Cancel
+                    {t.cancel}
                   </button>
                   <button onClick={handleConfirmAction}
                     className="flex-1 px-3 py-2 rounded-xl text-[10px] font-bold tracking-wide uppercase transition-transform"
                     style={{ background: `linear-gradient(to right, ${accentColor}, ${accentColor}cc)`, color: timeOfDay === 'day' ? '#1a1a1a' : '#fff', boxShadow: `0 4px 15px ${accentColor}60` }}>
-                    Yes
+                    {t.yes}
                   </button>
                 </div>
               </motion.div>
@@ -607,14 +763,14 @@ export default function App() {
             </motion.div>
             
             <p className="text-[11px] text-white/70 font-bold tracking-wide drop-shadow-md mb-3 h-4">
-              {mode === 'idle' ? 'select an action below:' : `executing in ${formatTime(timeLeft)}...`}
+              {mode === 'idle' ? t.selectAction : t.executingIn(formatTime(timeLeft))}
             </p>
 
             <div className="w-full h-px bg-white/10 mb-3"></div>
 
             {/* Action Selector */}
             <div className="w-full flex items-center justify-center gap-2 mb-4 relative" ref={dropRef}>
-              <span className="text-[9px] text-white/50 font-bold tracking-widest uppercase">action:</span>
+              <span className="text-[9px] text-white/50 font-bold tracking-widest uppercase">{t.actionLabel}</span>
               <div className="relative">
                 <button
                   onClick={() => mode === 'idle' && setIsOpen(!isOpen)}
@@ -623,7 +779,7 @@ export default function App() {
                   style={{ backgroundColor: 'rgba(42, 45, 53, 0.9)', backdropFilter: 'blur(12px)' }}
                 >
                   <CurrentIcon size={13} style={{ color: accentColor }} />
-                  <span className="text-[11px] font-bold text-white pr-1">{ACTION_CONFIG[action].label}</span>
+                  <span className="text-[11px] font-bold text-white pr-1">{actionLabel}</span>
                   <div className="w-4 h-4 flex items-center justify-center bg-white/5 rounded-full">
                     <ChevronRight size={9} className={`text-white/50 transition-transform duration-200 ${isOpen ? 'rotate-90' : ''}`} />
                   </div>
@@ -644,7 +800,7 @@ export default function App() {
                               ? { backgroundColor: `${accentColor}20`, color: accentColor } 
                               : { color: 'rgba(255,255,255,0.7)' }}>
                             <Icon size={13} />
-                            <span className="font-bold flex-1 text-left">{ACTION_CONFIG[key].label}</span>
+                            <span className="font-bold flex-1 text-left">{ACTION_CONFIG[key].label[lang]}</span>
                             {isActive && <Check size={12} strokeWidth={3} />}
                           </button>
                         );
@@ -657,9 +813,9 @@ export default function App() {
 
             {/* Timer */}
             <div className="flex gap-2.5 w-full justify-center mb-5">
-              <TimerBox label="hours" value={timer.h} max={99} onChange={(v) => setTimer(p => ({ ...p, h: v }))} disabled={mode === 'counting'} />
-              <TimerBox label="minutes" value={timer.m} max={59} onChange={(v) => setTimer(p => ({ ...p, m: v }))} disabled={mode === 'counting'} />
-              <TimerBox label="seconds" value={timer.s} max={59} onChange={(v) => setTimer(p => ({ ...p, s: v }))} disabled={mode === 'counting'} />
+              <TimerBox label={t.hours} value={timer.h} max={99} onChange={(v) => setTimer(p => ({ ...p, h: v }))} disabled={mode === 'counting'} />
+              <TimerBox label={t.minutes} value={timer.m} max={59} onChange={(v) => setTimer(p => ({ ...p, m: v }))} disabled={mode === 'counting'} />
+              <TimerBox label={t.seconds} value={timer.s} max={59} onChange={(v) => setTimer(p => ({ ...p, s: v }))} disabled={mode === 'counting'} />
             </div>
           </div>
 
@@ -676,7 +832,7 @@ export default function App() {
                     color: timeOfDay === 'day' ? '#1a1a1a' : '#fff' 
                   }}>
                   <div className="absolute inset-0 bg-white/20 translate-y-full group-hover:translate-y-0 transition-transform duration-300 ease-out" />
-                  <span className="relative z-10">Start Now</span>
+                  <span className="relative z-10">{t.startNow}</span>
                   <TimerIcon size={15} className="relative z-10 opacity-80" strokeWidth={2.5} />
                 </motion.button>
               ) : (
@@ -684,7 +840,7 @@ export default function App() {
                   whileHover={{ scale: 1.05 }} whileTap={{ scale: 0.95 }} onClick={handleCancel}
                   className="flex items-center justify-center gap-2 px-10 py-3 rounded-full border border-red-500/50 text-red-300 font-extrabold text-[11px] tracking-widest uppercase transition-colors"
                   style={{ backgroundColor: 'rgba(239, 68, 68, 0.2)', backdropFilter: 'blur(12px)' }}>
-                  <X size={15} strokeWidth={2.5} /><span>Cancel Timer</span>
+                  <X size={15} strokeWidth={2.5} /><span>{t.cancelTimer}</span>
                 </motion.button>
               )}
             </AnimatePresence>
@@ -695,6 +851,7 @@ export default function App() {
         <AnimatePresence>
           {toast && <Toast message={toast.message} type={toast.type} onClose={() => setToast(null)} />}
         </AnimatePresence>
+        </>)}
       </div>
     </div>
   );
