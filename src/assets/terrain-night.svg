@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 480 440" preserveAspectRatio="xMidYMid slice">
+  <defs>
+    <linearGradient id="m1" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#3a2a75"/>
+      <stop offset="100%" stop-color="#2e2260"/>
+    </linearGradient>
+    <linearGradient id="m2" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#2d2159"/>
+      <stop offset="100%" stop-color="#221848"/>
+    </linearGradient>
+    <linearGradient id="m3" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#231a47"/>
+      <stop offset="100%" stop-color="#1a1239"/>
+    </linearGradient>
+  </defs>
+
+  <!-- Горы ночные -->
+  <polygon points="0,220 30,175 62,200 98,165 135,195 172,160 208,188 246,155 283,183 320,160 356,188 393,168 428,195 450,180 480,195 480,440 0,440" fill="url(#m1)"/>
+  <polygon points="0,245 34,200 70,230 108,185 145,215 183,185 220,212 258,182 295,210 332,185 368,212 405,190 450,215 480,205 480,440 0,440" fill="url(#m2)"/>
+  <polygon points="0,272 30,228 60,255 95,212 128,243 163,208 198,237 233,208 268,237 303,210 338,240 372,215 405,243 438,220 480,232 480,440 0,440" fill="url(#m3)"/>
+</svg>

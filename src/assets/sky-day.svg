@@ -1,0 +1,65 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 480 440" preserveAspectRatio="xMidYMid slice">
+  <defs>
+    <linearGradient id="daySky" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#8fbde6"/>
+      <stop offset="55%" stop-color="#c6dff2"/>
+      <stop offset="100%" stop-color="#e8dcc4"/>
+    </linearGradient>
+    <radialGradient id="sunGlow" cx="50%" cy="50%" r="50%">
+      <stop offset="0%" stop-color="#ffe9a8" stop-opacity="0.55"/>
+      <stop offset="100%" stop-color="#ffe9a8" stop-opacity="0"/>
+    </radialGradient>
+    <radialGradient id="sunBody" cx="42%" cy="38%" r="70%">
+      <stop offset="0%" stop-color="#ffefad"/>
+      <stop offset="70%" stop-color="#ffc74e"/>
+      <stop offset="100%" stop-color="#f5a623"/>
+    </radialGradient>
+    <radialGradient id="cloudGrad" cx="50%" cy="40%" r="65%">
+      <stop offset="0%" stop-color="#ffffff"/>
+      <stop offset="100%" stop-color="#dfe9f3"/>
+    </radialGradient>
+  </defs>
+
+  <!-- Небо -->
+  <rect width="480" height="440" fill="url(#daySky)"/>
+
+  <!-- Тёплая дымка у горизонта -->
+  <ellipse cx="240" cy="250" rx="360" ry="85" fill="#f3e4c2" opacity="0.5"/>
+
+  <!-- Солнце -->
+  <circle cx="360" cy="115" r="78" fill="url(#sunGlow)"/>
+  <g stroke="#fff3c4" stroke-width="5" stroke-linecap="round" opacity="0.3">
+    <animateTransform attributeName="transform" type="rotate" from="0 360 115" to="360 360 115" dur="120s" repeatCount="indefinite"/>
+    <line x1="360" y1="115" x2="360" y2="53"/>
+    <line x1="360" y1="115" x2="360" y2="177"/>
+    <line x1="360" y1="115" x2="298" y2="115"/>
+    <line x1="360" y1="115" x2="422" y2="115"/>
+    <line x1="360" y1="115" x2="316" y2="71"/>
+    <line x1="360" y1="115" x2="404" y2="71"/>
+    <line x1="360" y1="115" x2="316" y2="159"/>
+    <line x1="360" y1="115" x2="404" y2="159"/>
+  </g>
+  <circle cx="360" cy="115" r="26" fill="url(#sunBody)"/>
+
+  <!-- Облака -->
+  <g>
+    <animateTransform attributeName="transform" type="translate" values="0 0; 16 0; 0 0" dur="48s" repeatCount="indefinite"/>
+    <ellipse cx="110" cy="112" rx="34" ry="15" fill="url(#cloudGrad)" opacity="0.95"/>
+    <ellipse cx="90" cy="106" rx="21" ry="12" fill="url(#cloudGrad)" opacity="0.9"/>
+    <ellipse cx="130" cy="106" rx="23" ry="13" fill="url(#cloudGrad)" opacity="0.9"/>
+    <ellipse cx="110" cy="98" rx="17" ry="10" fill="url(#cloudGrad)" opacity="0.95"/>
+  </g>
+  <g opacity="0.85">
+    <animateTransform attributeName="transform" type="translate" values="0 0; -12 0; 0 0" dur="60s" repeatCount="indefinite"/>
+    <ellipse cx="250" cy="172" rx="28" ry="12" fill="url(#cloudGrad)"/>
+    <ellipse cx="232" cy="167" rx="17" ry="9" fill="url(#cloudGrad)"/>
+    <ellipse cx="268" cy="167" rx="18" ry="10" fill="url(#cloudGrad)"/>
+    <ellipse cx="250" cy="160" rx="13" ry="8" fill="url(#cloudGrad)"/>
+  </g>
+  <g opacity="0.75">
+    <ellipse cx="430" cy="75" rx="24" ry="10" fill="url(#cloudGrad)"/>
+    <ellipse cx="415" cy="71" rx="14" ry="7" fill="url(#cloudGrad)"/>
+    <ellipse cx="445" cy="71" rx="15" ry="8" fill="url(#cloudGrad)"/>
+  </g>
+</svg>

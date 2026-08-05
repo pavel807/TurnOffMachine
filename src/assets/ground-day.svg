@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 480 440" preserveAspectRatio="xMidYMid slice">
+  <defs>
+    <linearGradient id="ridgeFill" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#8a7350"/>
+      <stop offset="100%" stop-color="#6b5a3e"/>
+    </linearGradient>
+  </defs>
+
+  <!-- Гряда переднего плана -->
+  <path d="M0,265 C40,258 80,265 120,260 C160,255 200,263 240,258 C280,253 320,261 360,257 C400,253 440,260 480,256 L480,440 L0,440 Z" fill="url(#ridgeFill)"/>
+
+  <!-- Ели дневные -->
+  <g fill="#4b3b25">
+    <polygon points="15,234 6,258 24,258"/><polygon points="15,245 4,270 26,270"/>
+    <polygon points="45,234 36,258 54,258"/><polygon points="45,245 34,270 56,270"/>
+    <polygon points="75,234 66,258 84,258"/><polygon points="75,245 64,270 86,270"/>
+    <polygon points="105,234 96,258 114,258"/><polygon points="105,245 94,270 116,270"/>
+    <polygon points="135,234 126,258 144,258"/><polygon points="135,245 124,270 146,270"/>
+    <polygon points="165,234 156,258 174,258"/><polygon points="165,245 154,270 176,270"/>
+    <polygon points="195,234 186,258 204,258"/><polygon points="195,245 184,270 206,270"/>
+    <polygon points="225,234 216,258 234,258"/><polygon points="225,245 214,270 236,270"/>
+    <polygon points="255,234 246,258 264,258"/><polygon points="255,245 244,270 266,270"/>
+    <polygon points="285,234 276,258 294,258"/><polygon points="285,245 274,270 296,270"/>
+    <polygon points="315,234 306,258 324,258"/><polygon points="315,245 304,270 326,270"/>
+    <polygon points="345,234 336,258 354,258"/><polygon points="345,245 334,270 356,270"/>
+    <polygon points="375,234 366,258 384,258"/><polygon points="375,245 364,270 386,270"/>
+    <polygon points="405,234 396,258 414,258"/><polygon points="405,245 394,270 416,270"/>
+    <polygon points="435,234 426,258 444,258"/><polygon points="435,245 424,270 446,270"/>
+    <polygon points="465,234 456,258 474,258"/><polygon points="465,245 454,270 476,270"/>
+  </g>
+</svg>

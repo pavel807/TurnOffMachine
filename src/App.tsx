@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react';
+import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
 import { 
   Power, 
@@ -15,7 +15,16 @@ import {
   Settings,
   Check,
   Download,
-  Loader2
+  Loader2,
+  Cpu,
+  MemoryStick,
+  BatteryLow,
+  BatteryMedium,
+  BatteryFull,
+  Zap,
+  Hourglass,
+  Sunrise,
+  Sunset
 } from 'lucide-react';
 import { getCurrentWindow } from '@tauri-apps/api/window';
 import { invoke } from '@tauri-apps/api/core';
@@ -25,15 +34,50 @@ import { check, type Update } from '@tauri-apps/plugin-updater';
 import { relaunch } from '@tauri-apps/plugin-process';
 import { openUrl } from '@tauri-apps/plugin-opener';
 
-// Импорты фонов
-import DaySvg from './assets/day.svg';
-import NightSvg from './assets/night.svg';
+// Импорты фонов (слои, собираются в единый кадр при появлении окна)
+import SkyMorning from './assets/sky-morning.svg';
+import SkyDay from './assets/sky-day.svg';
+import SkyEvening from './assets/sky-evening.svg';
+import SkyNight from './assets/sky-night.svg';
+import TerrainMorning from './assets/terrain-morning.svg';
+import TerrainDay from './assets/terrain-day.svg';
+import TerrainEvening from './assets/terrain-evening.svg';
+import TerrainNight from './assets/terrain-night.svg';
+import GroundMorning from './assets/ground-morning.svg';
+import GroundDay from './assets/ground-day.svg';
+import GroundEvening from './assets/ground-evening.svg';
+import GroundNight from './assets/ground-night.svg';
 
 // --- Types ---
 type ActionType = 'Shutdown' | 'Restart' | 'Sleep' | 'Hibernate';
 type AppMode = 'loading' | 'idle' | 'counting' | 'confirming';
-type TimeOfDay = 'day' | 'night';
+type TimeOfDay = 'morning' | 'day' | 'evening' | 'night';
 type Lang = 'en' | 'ru';
+
+interface SceneLayers { sky: string; terrain: string; ground: string; }
+
+const SCENE: Record<TimeOfDay, SceneLayers> = {
+  morning: { sky: SkyMorning, terrain: TerrainMorning, ground: GroundMorning },
+  day: { sky: SkyDay, terrain: TerrainDay, ground: GroundDay },
+  evening: { sky: SkyEvening, terrain: TerrainEvening, ground: GroundEvening },
+  night: { sky: SkyNight, terrain: TerrainNight, ground: GroundNight },
+};
+
+const TIME_ORDER: TimeOfDay[] = ['morning', 'day', 'evening', 'night'];
+
+const TIME_THEME: Record<TimeOfDay, { accent: string; bg: string; buttonBg: string; buttonColor: string }> = {
+  morning: { accent: '#fb923c', bg: '#261a2e', buttonBg: 'linear-gradient(to right, #f59e0b, #fbbf24)', buttonColor: '#1a1a1a' },
+  day: { accent: '#f5a623', bg: '#2b241a', buttonBg: 'linear-gradient(to right, #f5a623, #f7c948)', buttonColor: '#1a1a1a' },
+  evening: { accent: '#fb7185', bg: '#211228', buttonBg: 'linear-gradient(to right, #e11d48, #fb7185)', buttonColor: '#fff' },
+  night: { accent: '#a78bfa', bg: '#0f0a1e', buttonBg: 'linear-gradient(to right, #7c3aed, #a78bfa)', buttonColor: '#fff' },
+};
+
+const TIME_ICON: Record<TimeOfDay, React.ElementType> = {
+  morning: Sunrise,
+  day: Sun,
+  evening: Sunset,
+  night: CloudMoon,
+};
 
 const ACTION_CONFIG: Record<ActionType, { icon: React.ElementType; label: Record<Lang, string>; verb: Record<Lang, string> }> = {
   Shutdown: { icon: Power, label: { en: 'Shutdown', ru: 'Выключение' }, verb: { en: 'shutdown', ru: 'выключить' } },
@@ -92,6 +136,10 @@ interface I18n {
   installing: string;
   openReleases: string;
   updateError: string;
+  cpu: string;
+  ram: string;
+  battery: string;
+  remaining: string;
 }
 
 const T: Record<Lang, I18n> = {
@@ -100,7 +148,7 @@ const T: Record<Lang, I18n> = {
     greetingAfternoon: 'Good afternoon!',
     greetingEvening: 'Good evening!',
     loading: 'loading...',
-    toggleTheme: 'Toggle Day/Night',
+    toggleTheme: 'Change time of day',
     selectAction: 'select an action below:',
     executingIn: (time) => `executing in ${time}...`,
     actionLabel: 'action:',
@@ -144,13 +192,17 @@ const T: Record<Lang, I18n> = {
     installing: 'Installing...',
     openReleases: 'Open Releases page',
     updateError: 'Update failed. Download manually instead.',
+    cpu: 'CPU',
+    ram: 'RAM',
+    battery: 'Battery',
+    remaining: 'Remaining',
   },
   ru: {
     greetingMorning: 'Доброе утро!',
     greetingAfternoon: 'Добрый день!',
     greetingEvening: 'Добрый вечер!',
     loading: 'загрузка...',
-    toggleTheme: 'День/Ночь',
+    toggleTheme: 'Сменить время суток',
     selectAction: 'выберите действие ниже:',
     executingIn: (time) => `выполнение через ${time}...`,
     actionLabel: 'действие:',
@@ -194,6 +246,10 @@ const T: Record<Lang, I18n> = {
     installing: 'Установка...',
     openReleases: 'Открыть страницу релизов',
     updateError: 'Ошибка обновления. Скачайте вручную.',
+    cpu: 'CPU',
+    ram: 'RAM',
+    battery: 'Батарея',
+    remaining: 'Осталось',
   },
 };
 
@@ -226,7 +282,7 @@ const LoadingScreen = ({ onComplete, timeOfDay, lang }: { onComplete: () => void
   const radius = 120;
   const circumference = 2 * Math.PI * radius;
   const offset = circumference - (Math.min(progress, 100) / 100) * circumference;
-  const accent = timeOfDay === 'day' ? '#f5a623' : '#a78bfa';
+  const accent = TIME_THEME[timeOfDay].accent;
 
   return (
     <motion.div
@@ -303,7 +359,7 @@ const TitleBar: React.FC<TitleBarProps> = ({ timeOfDay, onToggleTheme, onToggleS
           className="w-6 h-6 flex items-center justify-center text-white/70 hover:text-white hover:bg-white/10 rounded-full transition-all border border-white/10"
           title={t.toggleTheme}
         >
-          {timeOfDay === 'day' ? <Sun size={12} strokeWidth={2.5} /> : <CloudMoon size={12} strokeWidth={2.5} />}
+          {(() => { const Icon = TIME_ICON[timeOfDay]; return <Icon size={12} strokeWidth={2.5} />; })()}
         </button>
         <button 
           onMouseDown={(e) => e.stopPropagation()}
@@ -388,6 +444,20 @@ const TimerBox: React.FC<TimerBoxProps> = ({ label, value, max, onChange, disabl
     </div>
   );
 };
+
+// --- StatChip ---
+interface StatChipProps { icon: React.ElementType; label: string; value: string; accent: string; }
+
+const StatChip: React.FC<StatChipProps> = ({ icon: Icon, label, value, accent }) => (
+  <div className="flex flex-col items-center justify-center rounded-2xl py-2 px-1 border border-white/10 flex-1 min-w-0 h-full"
+    style={{ backgroundColor: 'rgba(42, 45, 53, 0.8)', backdropFilter: 'blur(12px)', boxShadow: 'inset 0 2px 8px rgba(0,0,0,0.3)' }}>
+    <div className="flex items-center gap-1.5 mb-0.5">
+      <Icon size={11} strokeWidth={2.5} style={{ color: accent }} />
+      <span className="text-[11px] font-bold text-white tabular-nums truncate">{value}</span>
+    </div>
+    <span className="text-[7px] text-white/50 font-bold tracking-widest uppercase">{label}</span>
+  </div>
+);
 
 // --- Toast ---
 interface ToastProps { message: string; type: 'error' | 'success'; onClose: () => void; }
@@ -548,6 +618,9 @@ export default function App() {
   const dropRef = useRef<HTMLDivElement>(null);
   const settingsRef = useRef<HTMLDivElement>(null);
 
+  const [sysStats, setSysStats] = useState<{ cpu: number; memPct: number } | null>(null);
+  const [battery, setBattery] = useState<{ percent: number; charging: boolean } | null>(null);
+
   const t = T[lang];
   const actionLabel = ACTION_CONFIG[action].label[lang];
   const actionVerb = ACTION_CONFIG[action].verb[lang];
@@ -611,19 +684,34 @@ export default function App() {
     }
   };
 
-  // Авто-определение времени суток
-  const autoTimeOfDay: TimeOfDay = useMemo(() => {
-    const hour = new Date().getHours();
-    return hour >= 6 && hour < 18 ? 'day' : 'night';
+  // Авто-определение времени суток; состояние обновляется каждые 30 сек,
+  // поэтому фон меняется автоматически в реальном времени, без перезапуска
+  const getTimeOfDay = (d: Date): TimeOfDay => {
+    const hour = d.getHours();
+    if (hour >= 5 && hour < 11) return 'morning';
+    if (hour >= 11 && hour < 17) return 'day';
+    if (hour >= 17 && hour < 21) return 'evening';
+    return 'night';
+  };
+
+  const [autoTimeOfDay, setAutoTimeOfDay] = useState<TimeOfDay>(() => getTimeOfDay(new Date()));
+
+  useEffect(() => {
+    const id = setInterval(() => setAutoTimeOfDay(getTimeOfDay(new Date())), 30_000);
+    return () => clearInterval(id);
   }, []);
+
+  // Если ручной выбор совпал с наступившим автоматическим периодом — возвращаемся в авторежим
+  useEffect(() => {
+    setManualOverride(prev => (prev === autoTimeOfDay ? null : prev));
+  }, [autoTimeOfDay]);
 
   const timeOfDay: TimeOfDay = manualOverride ?? autoTimeOfDay;
 
   const toggleTheme = () => {
     setManualOverride(prev => {
-      if (prev === 'day') return 'night';
-      if (prev === 'night') return 'day';
-      return autoTimeOfDay === 'day' ? 'night' : 'day';
+      const current = prev ?? autoTimeOfDay;
+      return TIME_ORDER[(TIME_ORDER.indexOf(current) + 1) % TIME_ORDER.length];
     });
   };
 
@@ -663,6 +751,23 @@ export default function App() {
   useEffect(() => {
     getCurrentWindow().setAlwaysOnTop(settings.alwaysOnTop).catch(() => {});
   }, [settings.alwaysOnTop]);
+
+  useEffect(() => {
+    if (mode === 'loading') return;
+    const loadStats = async () => {
+      try {
+        const s = await invoke<{ cpu: number; memUsed: number; memTotal: number }>('get_system_stats');
+        setSysStats({ cpu: s.cpu, memPct: s.memTotal > 0 ? (s.memUsed / s.memTotal) * 100 : 0 });
+      } catch (e) { console.warn('Stats failed:', e); }
+      try {
+        const b = await invoke<{ percent: number | null; charging: boolean | null }>('get_battery_info');
+        setBattery(b.percent != null ? { percent: b.percent, charging: !!b.charging } : null);
+      } catch (e) { console.warn('Battery failed:', e); }
+    };
+    loadStats();
+    const interval = setInterval(loadStats, 2000);
+    return () => clearInterval(interval);
+  }, [mode]);
 
   const updateSetting = (key: BehaviorSettingKey) => {
     setSettings(prev => {
@@ -786,8 +891,8 @@ export default function App() {
   };
 
   const CurrentIcon = ACTION_CONFIG[action].icon;
-  const accentColor = timeOfDay === 'day' ? '#f5a623' : '#a78bfa';
-  const bgColor = timeOfDay === 'day' ? '#2b241a' : '#0f0a1e';
+  const accentColor = TIME_THEME[timeOfDay].accent;
+  const bgColor = TIME_THEME[timeOfDay].bg;
 
   return (
     <div className="w-screen h-screen flex items-center justify-center" style={{ background: 'transparent' }}>
@@ -800,20 +905,54 @@ export default function App() {
         </AnimatePresence>
 
         {mode !== 'loading' && (<>
-        {/* Background — используем img для обоих SVG, они растянутся на всю ширину */}
+        {/* Background — три слоя SVG, каждая половина смыкается слева и справа в единый кадр */}
         <div className="absolute -top-5 left-0 w-full h-[55%] z-0 pointer-events-none overflow-hidden rounded-t-[2.5rem]">
           <AnimatePresence mode="wait">
-            <motion.img
+            <motion.div
               key={timeOfDay}
-              src={timeOfDay === 'day' ? DaySvg : NightSvg}
-              alt=""
-              className="w-full h-full object-cover"
+              className="absolute inset-0"
               initial={{ opacity: 0 }}
               animate={{ opacity: 1 }}
               exit={{ opacity: 0 }}
-              transition={{ duration: 0.8 }}
-              style={{ width: '100%', height: '100%', objectFit: 'cover' }}
-            />
+              transition={{ duration: 0.35 }}
+            >
+              {(['left', 'right'] as const).map((side) => (
+                <motion.img
+                  key={`sky-${side}`}
+                  src={SCENE[timeOfDay].sky}
+                  alt=""
+                  className="absolute inset-0 w-full h-full"
+                  initial={{ x: side === 'left' ? '-100%' : '100%' }}
+                  animate={{ x: '0%' }}
+                  transition={{ duration: 0.6, ease: 'easeOut' }}
+                  style={{ objectFit: 'cover', clipPath: side === 'left' ? 'inset(0 50% 0 0)' : 'inset(0 0 0 50%)' }}
+                />
+              ))}
+              {(['left', 'right'] as const).map((side) => (
+                <motion.img
+                  key={`terrain-${side}`}
+                  src={SCENE[timeOfDay].terrain}
+                  alt=""
+                  className="absolute inset-0 w-full h-full"
+                  initial={{ x: side === 'left' ? '-100%' : '100%' }}
+                  animate={{ x: '0%' }}
+                  transition={{ duration: 0.65, ease: 'easeOut', delay: 0.12 }}
+                  style={{ objectFit: 'cover', clipPath: side === 'left' ? 'inset(0 50% 0 0)' : 'inset(0 0 0 50%)' }}
+                />
+              ))}
+              {(['left', 'right'] as const).map((side) => (
+                <motion.img
+                  key={`ground-${side}`}
+                  src={SCENE[timeOfDay].ground}
+                  alt=""
+                  className="absolute inset-0 w-full h-full"
+                  initial={{ x: side === 'left' ? '-100%' : '100%' }}
+                  animate={{ x: '0%' }}
+                  transition={{ duration: 0.6, ease: 'easeOut', delay: 0.24 }}
+                  style={{ objectFit: 'cover', clipPath: side === 'left' ? 'inset(0 50% 0 0)' : 'inset(0 0 0 50%)' }}
+                />
+              ))}
+            </motion.div>
           </AnimatePresence>
           <div className="absolute bottom-0 left-0 w-full h-32" 
                style={{ background: `linear-gradient(to top, ${bgColor}, transparent)` }} />
@@ -855,12 +994,11 @@ export default function App() {
                 <p className="text-[10px] text-white/60 leading-snug mb-4">{t.confirmDesc(actionVerb)}</p>
                 <div className="flex gap-2">
                   <button onClick={handleDenyAction}
-                    className="flex-1 px-3 py-2 rounded-xl text-[10px] font-bold tracking-wide uppercase border border-white/15 text-white/80 hover:bg-white/10 transition-colors">
-                    {t.cancel}
+                    className="flex-1 px-3 py-2 rounded-xl text-[10px] font-bold tracking-wide uppercase border border-white/15 text-white/80 hover:bg-white/10 transition-colors">                    {t.cancel}
                   </button>
                   <button onClick={handleConfirmAction}
                     className="flex-1 px-3 py-2 rounded-xl text-[10px] font-bold tracking-wide uppercase transition-transform"
-                    style={{ background: `linear-gradient(to right, ${accentColor}, ${accentColor}cc)`, color: timeOfDay === 'day' ? '#1a1a1a' : '#fff', boxShadow: `0 4px 15px ${accentColor}60` }}>
+                    style={{ background: `linear-gradient(to right, ${accentColor}, ${accentColor}cc)`, color: TIME_THEME[timeOfDay].buttonColor, boxShadow: `0 4px 15px ${accentColor}60` }}>
                     {t.yes}
                   </button>
                 </div>
@@ -945,6 +1083,25 @@ export default function App() {
             </div>
           </div>
 
+          {/* System stats */}
+          <div className="w-full flex items-stretch justify-center gap-2 mb-5">
+            <StatChip icon={Cpu} label={t.cpu} value={sysStats ? `${Math.round(sysStats.cpu)}%` : '—'} accent={accentColor} />
+            <StatChip icon={MemoryStick} label={t.ram} value={sysStats ? `${Math.round(sysStats.memPct)}%` : '—'} accent={accentColor} />
+            <StatChip
+              icon={battery ? (battery.charging ? Zap : battery.percent >= 80 ? BatteryFull : battery.percent >= 40 ? BatteryMedium : BatteryLow) : BatteryMedium}
+              label={t.battery} value={battery ? `${battery.percent}%` : '—'} accent={accentColor} />
+            <AnimatePresence>
+              {mode === 'counting' && (
+                <motion.div key="remaining" initial={{ opacity: 0, scale: 0.9 }} animate={{ opacity: 1, scale: 1 }} exit={{ opacity: 0, scale: 0.9 }}
+                  className="flex-1 min-w-0">
+                  <div className="h-full">
+                    <StatChip icon={Hourglass} label={t.remaining} value={formatTime(timeLeft)} accent={accentColor} />
+                  </div>
+                </motion.div>
+              )}
+            </AnimatePresence>
+          </div>
+
           {/* Start/Cancel */}
           <div className="w-full flex justify-center pb-1">
             <AnimatePresence mode="wait">
@@ -953,9 +1110,9 @@ export default function App() {
                   whileHover={{ scale: 1.05, boxShadow: `0 0 30px ${accentColor}80` }} whileTap={{ scale: 0.95 }} onClick={handleStart}
                   className="flex items-center justify-center gap-2 px-10 py-3 rounded-full font-extrabold text-[11px] tracking-widest uppercase relative overflow-hidden group"
                   style={{ 
-                    background: timeOfDay === 'day' ? 'linear-gradient(to right, #f5a623, #f7c948)' : 'linear-gradient(to right, #7c3aed, #a78bfa)', 
+                    background: TIME_THEME[timeOfDay].buttonBg, 
                     boxShadow: `0 6px 20px ${accentColor}60`, 
-                    color: timeOfDay === 'day' ? '#1a1a1a' : '#fff' 
+                    color: TIME_THEME[timeOfDay].buttonColor 
                   }}>
                   <div className="absolute inset-0 bg-white/20 translate-y-full group-hover:translate-y-0 transition-transform duration-300 ease-out" />
                   <span className="relative z-10">{t.startNow}</span>
@@ -1005,7 +1162,7 @@ export default function App() {
                       </button>
                       <button onClick={handleDownloadUpdate}
                         className="flex-1 px-3 py-2 rounded-xl text-[10px] font-bold tracking-wide uppercase transition-transform"
-                        style={{ background: `linear-gradient(to right, ${accentColor}, ${accentColor}cc)`, color: timeOfDay === 'day' ? '#1a1a1a' : '#fff', boxShadow: `0 4px 15px ${accentColor}60` }}>
+                        style={{ background: `linear-gradient(to right, ${accentColor}, ${accentColor}cc)`, color: TIME_THEME[timeOfDay].buttonColor, boxShadow: `0 4px 15px ${accentColor}60` }}>
                         {t.downloadAndInstall}
                       </button>
                     </div>
@@ -1040,7 +1197,7 @@ export default function App() {
                       </button>
                       <button onClick={() => { openUrl('https://github.com/pavel807/TurnOffMachine/releases/latest'); setUpdateModal(null); }}
                         className="flex-1 px-3 py-2 rounded-xl text-[10px] font-bold tracking-wide uppercase transition-transform"
-                        style={{ background: `linear-gradient(to right, ${accentColor}, ${accentColor}cc)`, color: timeOfDay === 'day' ? '#1a1a1a' : '#fff', boxShadow: `0 4px 15px ${accentColor}60` }}>
+                        style={{ background: `linear-gradient(to right, ${accentColor}, ${accentColor}cc)`, color: TIME_THEME[timeOfDay].buttonColor, boxShadow: `0 4px 15px ${accentColor}60` }}>
                         {t.openReleases}
                       </button>
                     </div>

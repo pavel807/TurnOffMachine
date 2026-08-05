@@ -1,5 +1,120 @@
+use std::process::Command as StdCommand;
+use std::sync::Mutex;
 use tauri::Manager;
 use tauri_plugin_shell::ShellExt;
+
+use sysinfo::{CpuRefreshKind, MemoryRefreshKind, RefreshKind, System};
+
+struct SystemState(Mutex<System>);
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SystemStats {
+    cpu: f32,
+    mem_used: u64,
+    mem_total: u64,
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct BatteryInfo {
+    percent: Option<u8>,
+    charging: Option<bool>,
+}
+
+#[tauri::command]
+fn get_system_stats(state: tauri::State<'_, SystemState>) -> SystemStats {
+    let mut sys = state.0.lock().unwrap();
+    sys.refresh_cpu_usage();
+    sys.refresh_memory();
+    SystemStats {
+        cpu: sys.global_cpu_usage(),
+        mem_used: sys.used_memory(),
+        mem_total: sys.total_memory(),
+    }
+}
+
+#[tauri::command]
+async fn get_battery_info() -> BatteryInfo {
+    #[cfg(target_os = "macos")]
+    {
+        if let Ok(out) = StdCommand::new("pmset").args(["-g", "batt"]).output() {
+            let text = String::from_utf8_lossy(&out.stdout);
+            for line in text.lines() {
+                for token in line.split_whitespace() {
+                    if let Some(pct) = token.strip_suffix("%;") {
+                        if let Ok(p) = pct.parse::<u8>() {
+                            let charging = !line.to_lowercase().contains("discharging");
+                            return BatteryInfo {
+                                percent: Some(p.min(100)),
+                                charging: Some(charging),
+                            };
+                        }
+                    }
+                }
+            }
+        }
+        BatteryInfo {
+            percent: None,
+            charging: None,
+        }
+    }
+    #[cfg(target_os = "windows")]
+    {
+        let script = "$b = Get-CimInstance Win32_Battery | Select-Object -First 1; if ($b) { \"$($b.EstimatedChargeRemaining);$($b.BatteryStatus)\" }";
+        if let Ok(out) = StdCommand::new("powershell")
+            .args(["-NoProfile", "-Command", script])
+            .output()
+        {
+            let text = String::from_utf8_lossy(&out.stdout);
+            let s = text.trim();
+            if !s.is_empty() {
+                let mut parts = s.splitn(2, ';');
+                if let (Some(p), Some(st)) = (parts.next(), parts.next()) {
+                    if let Ok(p) = p.trim().parse::<u8>() {
+                        let charging = st.trim() != "1";
+                        return BatteryInfo {
+                            percent: Some(p.min(100)),
+                            charging: Some(charging),
+                        };
+                    }
+                }
+            }
+        }
+        BatteryInfo {
+            percent: None,
+            charging: None,
+        }
+    }
+    #[cfg(target_os = "linux")]
+    {
+        for name in ["BAT0", "BAT1", "BAT2"] {
+            let base = format!("/sys/class/power_supply/{name}");
+            let Ok(cap) = std::fs::read_to_string(format!("{base}/capacity")) else {
+                continue;
+            };
+            let Ok(p) = cap.trim().parse::<u8>() else {
+                continue;
+            };
+            let status = std::fs::read_to_string(format!("{base}/status")).unwrap_or_default();
+            return BatteryInfo {
+                percent: Some(p.min(100)),
+                charging: Some(status.trim() == "Charging"),
+            };
+        }
+        BatteryInfo {
+            percent: None,
+            charging: None,
+        }
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
+    {
+        BatteryInfo {
+            percent: None,
+            charging: None,
+        }
+    }
+}
 
 #[tauri::command]
 async fn execute_power_action(
@@ -120,6 +235,16 @@ pub fn run() {
         ))
         .plugin(tauri_plugin_updater::Builder::new().build())
         .setup(|app| {
+            let mut sys = System::new_with_specifics(
+                RefreshKind::nothing()
+                    .with_cpu(CpuRefreshKind::everything())
+                    .with_memory(MemoryRefreshKind::everything()),
+            );
+            sys.refresh_cpu_usage();
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            sys.refresh_cpu_usage();
+            app.manage(SystemState(Mutex::new(sys)));
+
             #[cfg(target_os = "macos")]
             {
                 use objc2_app_kit::{NSColor, NSWindow};
@@ -138,7 +263,9 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             execute_power_action,
-            cancel_power_action
+            cancel_power_action,
+            get_system_stats,
+            get_battery_info
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
