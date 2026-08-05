@@ -792,7 +792,7 @@ export default function App() {
   return (
     <div className="w-screen h-screen flex items-center justify-center" style={{ background: 'transparent' }}>
       <div className={`relative w-112.5 h-187.5 rounded-[2.5rem] overflow-hidden ${mode === 'loading' ? 'border-transparent' : 'border border-white/10'}`}
-           style={{ backgroundColor: mode === 'loading' ? 'transparent' : bgColor, boxShadow: '0 25px 60px -10px rgba(0,0,0,0.5)', zoom: 0.8333 }}>
+           style={{ backgroundColor: mode === 'loading' ? 'transparent' : bgColor, zoom: 0.8333 }}>
         
         {/* Loading — пока идёт загрузка, интерфейс скрыт, окно прозрачное (виден рабочий стол) */}
         <AnimatePresence>
