@@ -1,0 +1,104 @@
+[package]
+name = "jarvis-core"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+# Голосовой стек: микрофон (cpal/CoreAudio), Silero TTS и FastConformer STT
+# на candle-CPU, wav-чтение (hound), токенизаторы. Всё это работает и на
+# iOS: tap-to-talk вместо wake-слова, модели качаются в отдельную папку.
+cpal.workspace = true
+hound.workspace = true
+candle-core.workspace = true
+candle-nn.workspace = true
+tokenizers.workspace = true
+# БПФ iSTFT-головы ZAC-декодера и fbank спикер-энкодера (zonos3).
+rustfft = "6.4"
+rand.workspace = true
+serde.workspace = true
+toml.workspace = true
+urlencoding.workspace = true
+open.workspace = true
+serde_json.workspace = true
+tar.workspace = true
+flate2.workspace = true
+ureq = { workspace = true, features = ["json"] }
+# Локальное время для планировщика («каждое утро в 8»).
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+regex.workspace = true
+redb.workspace = true
+minimp3 = "0.6.1"
+# Потоковый ресемплинг с антиалиасингом (см. crates/jarvis-core/src/resample.rs).
+rubato.workspace = true
+
+# spark (плагины с десктопной автоматизацией) и wake-слово (RustPotter) —
+# только не-iOS: на телефоне нет окон/клавиатуры/мыши, а слушание включается
+# кнопкой (tap-to-talk) без постоянного детектора фразы.
+[target.'cfg(not(target_os = "ios"))'.dependencies]
+spark = { path = "../spark" }
+rustpotter.workspace = true
+
+# iOS: активация аудио-сессии (микрофон + динамик) через AVFAudio.
+# objc2-* — собственная версия 0.3.x, совместимая с objc2 0.6;
+# block2 — блок-обработчик запроса разрешения на микрофон.
+[target.'cfg(target_os = "ios")'.dependencies]
+objc2-avf-audio = "0.3"
+objc2 = "0.6"
+block2 = "0.6"
+
+# macOS: AppleScript прямо в процессе приложения (NSAppleScript), а не через
+# порождение osascript. Так запрос разрешения на автоматизацию приходит от
+# самого Джарвиса — «Джарвис хочет управлять Музыкой» — и его можно выдать
+# один раз, вместо поиска нужного пункта в Системных настройках.
+[target.'cfg(target_os = "macos")'.dependencies]
+# CoreML для фильтра говорящего включается только на macOS.
+speakrs = { workspace = true, features = ["coreml", "cpu"] }
+# Metal-бэкенд candle — только macOS: на Linux и Windows считаем на CPU.
+# Записи ниже дополняют features базовых зависимостей (см. [dependencies]).
+candle-core = { workspace = true, features = ["metal"] }
+candle-nn = { workspace = true, features = ["metal"] }
+# objc2 — AppleScript в процессе; block2 — блок-обработчик запроса доступа
+# к микрофону (AVFoundation). В objc2 0.6 блоки вынесены в отдельный крейт.
+objc2 = "0.6"
+block2 = "0.6"
+objc2-foundation = { version = "0.3", features = [
+    "NSString",
+    "NSDictionary",
+    "NSAppleScript",
+    "NSAppleEventDescriptor",
+    "NSThread",
+] }
+uzu = { git = "https://github.com/trymirai/uzu", rev = "d76d468a1898cacc9c4920accf8f5ff099967107", default-features = false, features = [
+    "backend-cpu",
+    "backend-metal",
+] }
+# Прямая зависимость для обёртки uzu_backend: свой multi-thread runtime
+# (Engine uzu требует tokio-контекст) и таймауты на сетевые операции.
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "time"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+speakrs = { workspace = true, features = ["cpu"] }
+# Эмбеддинги wake word считаются этим же энкодером: на macOS Accelerate
+# уже включён, на Linux при желании добавь features = ["mkl"] (сборка
+# скачивает MKL) — без BLAS окно 1.2 с считается за ~2 с вместо ~0.1 с.
+candle-core = { workspace = true}
+candle-nn = { workspace = true}
+# AT-SPI2 — Linux-эквивалент macOS Accessibility: чтение дерева элементов UI,
+# клики и ввод текста по именам элементов (ui_read/ui_click/ui_type/ui_menu).
+atspi = { version = "0.30", default-features = true, features = ["tokio", "zbus"] }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "time"] }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+# Windows считает на CPU, как Linux: без этого speakrs падает на сборке
+# с «needs an inference backend».
+speakrs = { workspace = true, features = ["cpu"] }
+# UI Automation — Windows-эквивалент macOS Accessibility: чтение дерева
+# элементов UI, клики и ввод по именам элементов (ui_read/ui_click/ui_type/
+# ui_menu). xa11y уже в дереве зависимостей (autocore), провайдер
+# xa11y-windows добавляет UIA-бэкенд без новых тяжёлых зависимостей.
+xa11y = { version = "0.16", default-features = false }
+xa11y-windows = { version = "0.16", default-features = false }
+
+[dev-dependencies]
+tempfile = "3"

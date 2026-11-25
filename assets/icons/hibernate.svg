@@ -1,0 +1,28 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 48 48" width="48" height="48" fill="none">
+  <defs>
+    <linearGradient id="hib-body" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="currentColor"/>
+      <stop offset="1" stop-color="currentColorDark"/>
+    </linearGradient>
+  </defs>
+
+  <!-- Диск: корпус накопителя -->
+  <rect x="7" y="26" width="34" height="15" rx="4.5"
+        stroke="url(#hib-body)" stroke-width="2.6"/>
+  <circle cx="14.5" cy="33.5" r="1.9" fill="currentColor"/>
+  <path d="M21 33.5h13" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"/>
+
+  <!-- Стрелка сохранения состояния вниз, на диск -->
+  <path d="M24 6v13" stroke="url(#hib-body)" stroke-width="2.8" stroke-linecap="round"/>
+  <path d="M18.4 13.6 24 19.4l5.6-5.8"
+        stroke="currentColor" stroke-width="2.8"
+        stroke-linecap="round" stroke-linejoin="round"/>
+
+  <!-- Сон: Zz -->
+  <path d="M31.5 7.5h5.2l-5.2 5.6h5.2"
+        stroke="currentColor" stroke-width="2.1"
+        stroke-linecap="round" stroke-linejoin="round" opacity="0.75"/>
+  <path d="M39.4 15.4h3.4l-3.4 3.7h3.4"
+        stroke="currentColor" stroke-width="1.7"
+        stroke-linecap="round" stroke-linejoin="round" opacity="0.5"/>
+</svg>

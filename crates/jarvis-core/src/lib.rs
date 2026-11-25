@@ -1,0 +1,159 @@
+//! jarvis-core: движок голосового ассистента (wake word, STT, TTS, LLM, команды).
+
+/// Тюнинг рантайма до первой тензорной операции. candle на сотнях мелких
+/// операций энкодера/фронтенда теряет до 20× на оверхеде rayon-пула из
+/// многих потоков (замер: 12 потоков — 1956 мс на окно 1.2 с, 4 — 58 мс,
+/// 1 — 99 мс). Cap задевает только элементные операции: matmul считает
+/// через собственный трединг matrixmultiply и не меняется.
+pub fn init_tuning() {
+    use std::sync::Once;
+    static ONCE: Once = Once::new();
+    ONCE.call_once(|| {
+        let cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
+        let threads = cores.min(4).max(1).to_string();
+        // RAYON_NUM_THREADS читается rayon'ом при создании глобального пула —
+        // до первого par_iter. set_var небезопасен в edition 2024: других
+        // записей окружения в процессе нет, гонок нет.
+        unsafe { std::env::set_var("RAYON_NUM_THREADS", threads) };
+    });
+}
+
+/// Тесты, которые мутируют глобальное окружение (`JARVIS_HOME`), обязаны
+/// держать этот мьютекс: параллельный тест, читающий пути, иначе поймает
+/// чужую временную папку (реальный случай — schedule против tasks).
+#[cfg(test)]
+pub(crate) mod test_support {
+    pub(crate) static FS_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+}
+
+pub mod agent;
+pub mod applescript;
+pub mod asr;
+pub mod audio;
+pub mod calc;
+pub mod choice;
+pub mod commands;
+pub mod db;
+// Полный движок с wake-словом — десктопный: на iOS tap-to-talk без
+// постоянного прослушивания, его место занимает mobile.
+#[cfg(not(target_os = "ios"))]
+pub mod engine;
+pub mod events;
+pub mod facts;
+pub mod jokes;
+pub mod learned;
+pub mod llm;
+/// Журнал: dev — терминал, prod — только GUI (события в интерфейс).
+pub mod logging;
+pub mod mcp;
+pub mod memory;
+pub mod model_fetch;
+pub mod nn;
+pub mod observe;
+pub mod omograph;
+pub mod paths;
+pub mod permissions;
+pub mod platform;
+pub mod resample;
+// Плагины Spark автоматизируют десктоп (окна, клавиатура, мышь) — на
+// iPhone/iPad им нечего автоматизировать, и крейт на iOS не собирается.
+#[cfg(not(target_os = "ios"))]
+pub mod plugins;
+
+/// Текущее время в RFC3339 без внешних зависимостей: дата из `date +%F`,
+/// время посекундно из системного вызова — точности снимка достаточно.
+fn time_now_rfc3339() -> String {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let days = secs / 86400;
+    // Гражданская дата (алгоритм Ховарда Хиннанта): без chrono.
+    let z = (days + 719_468) as i64;
+    let era = z / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    let rem = secs % 86400;
+    format!("{y:04}-{m:02}-{d:02}T{:02}:{:02}:{:02}Z", rem / 3600, (rem % 3600) / 60, rem % 60)
+}
+
+/// Стартовый прогрев «знания о системе»: сканирование установленных
+/// приложений в базу (память + JSON на диске) и компиляция плагинов в
+/// фоне. Вызывается один раз при запуске ассистента — модель получает
+/// готовый каталог мгновенно, а не после первого обхода каталогов.
+pub fn warm_startup() {
+    std::thread::spawn(|| {
+        // База приложений: список в памяти уже прогрет ленивым кэшем
+        // платформенного слоя, на диск пишем снимок для наблюдаемости.
+        let apps = platform::app_db_entries();
+        let file = paths::app_data_dir().join("app_db.json");
+        // Каталог может не существовать при первом запуске: модельные
+        // загрузки создают его позже и параллельно — не полагаемся на них.
+        if let Some(parent) = file.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let db = serde_json::json!({
+            "обновлено": time_now_rfc3339(),
+            "приложений": apps.len(),
+            "приложения": apps.iter().map(|(name, exec, id)| serde_json::json!({
+                "имя": name, "бинарь": exec, "id": id,
+            })).collect::<Vec<_>>(),
+        });
+        match serde_json::to_string_pretty(&db)
+            .ok()
+            .and_then(|s| std::fs::write(&file, s).ok())
+        {
+            Some(()) => println!("📚 База приложений: {} записей — {}", apps.len(), file.display()),
+            None => eprintln!("⚠️ Не записал базу приложений в {}", file.display()),
+        }
+    });
+    // Плагины на Spark: скан каталогов, компиляция с кэшем — в своём потоке.
+    // iOS: плагинов нет (см. mod plugins).
+    #[cfg(not(target_os = "ios"))]
+    plugins::warm();
+}
+pub mod prompt_budget;
+pub mod router;
+pub mod schedule;
+pub mod settings;
+pub mod site_cache;
+pub mod stress;
+pub mod telegram;
+// Фильтр говорящего (speakrs) — десктопная фича: без постоянного
+// прослушивания на телефоне профилю голоса неоткуда взяться.
+#[cfg(not(target_os = "ios"))]
+pub mod speaker;
+pub mod stt;
+pub mod tasks;
+pub mod text;
+pub mod timers;
+pub mod tool_guard;
+pub mod tools;
+pub mod topic;
+pub mod tts;
+pub mod tts_normalizer;
+pub mod tts_zonos;
+pub mod auto;
+// Wake-слово (RustPotter) — десктоп: на iOS слушание включается кнопкой.
+#[cfg(not(target_os = "ios"))]
+pub mod wake;
+#[cfg(not(target_os = "ios"))]
+pub mod wake_ctc;
+#[cfg(not(target_os = "ios"))]
+pub mod wake_phrase;
+#[cfg(not(target_os = "ios"))]
+pub mod wake_train;
+#[cfg(not(target_os = "ios"))]
+pub mod wake_worker;
+pub mod weather;
+pub mod web;
+/// Мобильный движок iOS: tap-to-talk (микрофон → FastConformer → LLM →
+/// ZONOS3) на тех же моделях, что и десктоп, без wake-слова и автоматизации.
+#[cfg(target_os = "ios")]
+pub mod mobile;

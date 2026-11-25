@@ -1,0 +1,40 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 1100"
+     width="1200" height="1100" preserveAspectRatio="none">
+<defs>
+<linearGradient id="sky" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#160f2e"/><stop offset="0.24" stop-color="#3d1b4e"/><stop offset="0.48" stop-color="#8e2f5c"/><stop offset="0.7" stop-color="#e05a54"/><stop offset="0.88" stop-color="#ff9a52"/><stop offset="1" stop-color="#ffd08a"/></linearGradient>
+<radialGradient id="set" cx="0.5" cy="0.5" r="0.5"><stop offset="0" stop-color="#ffd08a" stop-opacity="0.9"/><stop offset="0.5" stop-color="#ff6b4a" stop-opacity="0.32"/><stop offset="1" stop-color="#ff6b4a" stop-opacity="0"/></radialGradient>
+<linearGradient id="cloudE" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#43204f"/><stop offset="0.55" stop-color="#2a1338"/><stop offset="1" stop-color="#1a0c26"/></linearGradient>
+<radialGradient id="haloE" cx="0.5" cy="0.5" r="0.5"><stop offset="0" stop-color="#ff9d6b" stop-opacity="0.22"/><stop offset="1" stop-color="#ff9d6b" stop-opacity="0"/></radialGradient>
+<linearGradient id="band" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#ff8a5c" stop-opacity="0"/><stop offset="1" stop-color="#ffb877" stop-opacity="0.5"/></linearGradient>
+</defs>
+<rect width="1200" height="1100" fill="url(#sky)"/>
+<g fill="#ffe4c4"><circle cx="393" cy="68" r="1.2" opacity="0.29"/><circle cx="642" cy="137" r="0.7" opacity="0.36"/><circle cx="56" cy="159" r="0.7" opacity="0.25"/><circle cx="1160" cy="35" r="1.5" opacity="0.37"/><circle cx="182" cy="58" r="1.0" opacity="0.50"/><circle cx="656" cy="40" r="0.8" opacity="0.34"/><circle cx="812" cy="157" r="0.8" opacity="0.37"/><circle cx="545" cy="116" r="1.3" opacity="0.42"/><circle cx="299" cy="204" r="0.9" opacity="0.39"/><circle cx="870" cy="112" r="1.4" opacity="0.28"/><circle cx="1042" cy="120" r="1.2" opacity="0.39"/><circle cx="694" cy="166" r="1.2" opacity="0.44"/></g>
+<ellipse cx="420" cy="720" rx="640" ry="300" fill="url(#set)"/>
+<circle cx="420" cy="700" r="60" fill="#ffdca0" opacity="0.92"/>
+<g>
+  <g transform="translate(290,300) scale(1.3)">
+    <ellipse cx="0" cy="-20" rx="118" ry="52" fill="url(#haloE)"/>
+    <path d="M-92,0A20,20 0 0 1 -70,-20A26,26 0 0 1 -24,-40A30,30 0 0 1 30,-38A22,22 0 0 1 68,-20A18,18 0 0 1 92,0Z" transform="translate(0,-5)" fill="#ff9d6b" opacity="0.5"/>
+    <path d="M-92,0A20,20 0 0 1 -70,-20A26,26 0 0 1 -24,-40A30,30 0 0 1 30,-38A22,22 0 0 1 68,-20A18,18 0 0 1 92,0Z" fill="url(#cloudE)"/>
+  </g>
+  <g transform="translate(880,250) scale(1.15)" opacity="0.9">
+    <ellipse cx="0" cy="-20" rx="118" ry="52" fill="url(#haloE)"/>
+    <path d="M-92,0A20,20 0 0 1 -70,-20A26,26 0 0 1 -24,-40A30,30 0 0 1 30,-38A22,22 0 0 1 68,-20A18,18 0 0 1 92,0Z" transform="translate(0,-4)" fill="#ffb27a" opacity="0.45"/>
+    <path d="M-92,0A20,20 0 0 1 -70,-20A26,26 0 0 1 -24,-40A30,30 0 0 1 30,-38A22,22 0 0 1 68,-20A18,18 0 0 1 92,0Z" fill="url(#cloudE)"/>
+  </g>
+  <g transform="translate(620,430) scale(1.55)" opacity="0.95">
+    <ellipse cx="0" cy="-20" rx="120" ry="54" fill="url(#haloE)"/>
+    <path d="M-92,0A20,20 0 0 1 -70,-20A26,26 0 0 1 -24,-40A30,30 0 0 1 30,-38A22,22 0 0 1 68,-20A18,18 0 0 1 92,0Z" transform="translate(0,-4)" fill="#ffc79a" opacity="0.5"/>
+    <path d="M-92,0A20,20 0 0 1 -70,-20A26,26 0 0 1 -24,-40A30,30 0 0 1 30,-38A22,22 0 0 1 68,-20A18,18 0 0 1 92,0Z" fill="url(#cloudE)"/>
+  </g>
+  <g transform="translate(130,480) scale(0.8)" opacity="0.7">
+    <path d="M-60,0A14,14 0 0 1 -44,-14A20,20 0 0 1 -6,-26A18,18 0 0 1 28,-22A14,14 0 0 1 52,-8A10,10 0 0 1 60,0Z" transform="translate(0,-3)" fill="#ffb27a" opacity="0.4"/>
+    <path d="M-60,0A14,14 0 0 1 -44,-14A20,20 0 0 1 -6,-26A18,18 0 0 1 28,-22A14,14 0 0 1 52,-8A10,10 0 0 1 60,0Z" fill="url(#cloudE)"/>
+  </g>
+  <g transform="translate(1070,410) scale(0.9)" opacity="0.75">
+    <path d="M-60,0A14,14 0 0 1 -44,-14A20,20 0 0 1 -6,-26A18,18 0 0 1 28,-22A14,14 0 0 1 52,-8A10,10 0 0 1 60,0Z" transform="translate(0,-3)" fill="#ffb27a" opacity="0.4"/>
+    <path d="M-60,0A14,14 0 0 1 -44,-14A20,20 0 0 1 -6,-26A18,18 0 0 1 28,-22A14,14 0 0 1 52,-8A10,10 0 0 1 60,0Z" fill="url(#cloudE)"/>
+  </g>
+</g>
+<rect y="640" width="1200" height="300" fill="url(#band)"/>
+</svg>

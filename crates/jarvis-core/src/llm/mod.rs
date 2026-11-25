@@ -1,0 +1,2597 @@
+//! Локальный LLM: диспетчер бэкендов + фоновая загрузка, потоковая генерация
+//! с озвучкой по предложениям и отменой.
+//!
+//! Два бэкенда за общим интерфейсом [`LlmEngine`]:
+//! - [`candle_backend`] — чистый candle (MiniCPM5-1B-ru, Qwen3.5-0.8B),
+//!   реализации архитектур свои, работает на любой платформе;
+//! - [`uzu_backend`] — движок Uzu (Mirai) на Metal, только macOS, модели
+//!   из каталога Mirai (Qwen3.5 0.8B–9B в 4/8-бит).
+//!
+//! Выбор — `llm_backend` в settings.toml (`"uzu"` | `"candle"`). Если uzu
+//! недоступен (нет сети для каталога, модель не скачалась) — автоматический
+//! откат на candle.
+
+pub mod api_backend;
+pub mod candle_backend;
+pub mod config;
+pub mod model;
+pub mod qwen35;
+pub mod sampler;
+pub mod streaming;
+pub mod template;
+#[cfg(target_os = "macos")]
+pub mod uzu_backend;
+
+use crate::events::{EventTx, JarvisEvent};
+use crate::router;
+use crate::tools;
+use anyhow::{Context, Result};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::mpsc::Sender;
+use std::sync::{Arc, Condvar, Mutex, MutexGuard};
+use std::time::Duration;
+
+pub use template::ChatTurn;
+
+/// Сколько обменов (вопрос+ответ) держать в разговорной памяти. 6 было
+/// впритык: «а почему?» после двух уточнений уже теряло контекст.
+pub const MAX_HISTORY_ENTRIES: usize = 10;
+
+/// Номер последнего обращения пользователя.
+///
+/// Веб-поиск идёт секунды и больше. Без сверки его результат озвучивается
+/// тогда, когда пользователь уже задал следующий вопрос или сказал «стоп» —
+/// и слышит он чужой, давно не нужный ответ. Фоновые ветки снимают номер
+/// на старте и сравнивают перед озвучкой.
+static REQUEST_GEN: AtomicU64 = AtomicU64::new(0);
+
+/// Пользователь обратился снова: поднимает номер запроса.
+pub fn new_request() -> u64 {
+    REQUEST_GEN.fetch_add(1, Ordering::SeqCst) + 1
+}
+
+/// Актуален ли ещё запрос `req_id` — ничего нового пользователь не говорил.
+pub fn is_current_request(req_id: u64) -> bool {
+    REQUEST_GEN.load(Ordering::SeqCst) == req_id
+}
+
+/// Текущий номер запроса — его снимают перед `spawn`, чтобы потом сравнить.
+pub fn request_snapshot() -> u64 {
+    REQUEST_GEN.load(Ordering::SeqCst)
+}
+
+/// Сколько обработок просьб завершилось: одноразовые режимы (CLI `--say`)
+/// по приросту этого счётчика ждут конца действия, не выходя посреди.
+static ASK_DONE: AtomicU64 = AtomicU64::new(0);
+
+pub fn asks_completed() -> u64 {
+    ASK_DONE.load(Ordering::SeqCst)
+}
+
+fn ask_done() {
+    ASK_DONE.fetch_add(1, Ordering::SeqCst);
+}
+
+/// Промпт для ответов по результатам веб-поиска.
+/// Глубокое исследование (по логике OpenJarvis deep-research): модель сама
+/// делает несколько поисков с разными формулировками и синтезирует ответ
+/// со списком источников. Работает существующий агентный цикл — research
+/// лишь запрещает сворачивать первый web_search в одно-хоповую сводку.
+pub const RESEARCH_SYSTEM_PROMPT: &str = concat!(
+    "Ты голосовой ассистент, и тебе поручили ИССЛЕДОВАТЬ вопрос. ",
+    "Сделай 2–4 web_search с разными формулировками (узкий запрос, синонимы, год), ",
+    "сопоставь сниппеты между собой, найди расхождения и цифры. ",
+    "Затем ответь по-русски: краткий вывод, 2–4 факта с числами, что осталось неясным, ",
+    "и источники доменами (например «по данным auto.ru»). Без markdown и эмодзи — ",
+    "ответ озвучивается. Если поиска не хватает — сделай ещё; не выдумывай."
+);
+
+pub const WEB_SYSTEM_PROMPT: &str = concat!(
+    "Ты голосовой ассистент (мужской род: «готов», «понял»). Ниже свежие результаты поиска. ",
+    "Ответь по-русски одним-двумя предложениями, только суть, без вступлений и без ссылок. ",
+    "Используй только факты из результатов; чего в них нет — того не говори. ",
+    "Без markdown и эмодзи: ответ озвучивается синтезом речи."
+);
+
+/// Системный промпт нейро-нормализации текста для TTS.
+pub const NORMALIZE_SYSTEM_PROMPT: &str = "Ты нормализатор текста для синтеза речи на русском. Перепиши текст, заменив все цифры, числа, единицы измерения, сокращения и символы на их произнесение русскими словами с правильными падежами. Примеры: «2 м/с» → «два метра в секунду»; «21°C» → «двадцать один градус Цельсия»; «1000» → «тысяча»; «12:30» → «двенадцать тридцать». Ничего кроме этих замен не меняй. Верни только готовый текст одной строкой.";
+
+/// Базовый системный промпт для разговорного режима (без tool-инструкций).
+///
+/// Универсальный ассистент: не только команды, но и любые вопросы — факты,
+/// «почему», математика, даты, советы. Коротко намеренно: длинный промпт
+/// для модели такого размера был чистым шумом.
+pub const CHAT_SYSTEM_PROMPT: &str = concat!(
+    "Ты Джарвис — живой голосовой ассистент, мужской род. Обращайся «сэр». ",
+    "Говори по-русски как человек в разговоре: коротко, 1–3 предложения, ",
+    "естественно и с лёгким теплом — без канцелярита, markdown и эмодзи ",
+    "(тебя озвучивает синтез). Живая речь: «Ага, понял», «Сию минуту, сэр», ",
+    "«Есть», «Так точно», «Кстати», лёгкая ирония в тему — но без подхалимства ",
+    "и не в каждом ответе. Когда уместно, задай короткий уточняющий вопрос ",
+    "или предложи следующий шаг, чтобы разговор продолжился. ",
+    "Ты умеешь всё: факты, «почему», даты, математика, переводы, советы, ",
+    "шутки и маленькие истории — рассказывай сразу, а не «могу придумать». ",
+    "Точные числа, цены, имена, свежие данные — вызывай web_search и отвечай ",
+    "по результатам; не уверен — «не знаю», не выдумывай. ",
+    "Действие — один блок ",
+    "<tool>{\"name\":\"имя\",\"args\":{...}}</tool> (open_app, окна, таймеры, файлы, музыка); ",
+    "без блока — текстовый ответ."
+);
+/// Вариант для uzu-модели 2B. Жёсткое «не знаешь — скажи „не знаю“» писали
+/// против галлюцинаций 0.8B, а 2B начинает отказываться даже там, где знает
+/// ответ («8×13», «что такое Rust»), и лезет в ответ шаблон «ИМЯ» из примера.
+/// Для неё честность мягче, а заполнитель примера менее «копируемый».
+pub const UZU_CHAT_SYSTEM_PROMPT: &str = concat!(
+    "Ты Джарвис — живой голосовой ассистент, мужской род, обращайся «сэр». ",
+    "По-русски коротко: одно-три предложения, без markdown и эмодзи — тебя озвучивает синтез. ",
+    "Говори как человек: «Ага, понял, сэр», «Сию минуту», «Есть» — и лёгкая ирония в тему; ",
+    "когда уместно, задай короткий уточняющий вопрос. ",
+    "Погода, курсы, цены, новости, люди, события, свежие данные — вызывай web_search ",
+    "и отвечай строго по его результатам; поиска нет или он пуст — «не знаю». ",
+    "Числа и имена без поиска не выдумывай. ",
+    "Общеизвестное (столицы, классики, таблица умножения) отвечай уверенно. ",
+    "Шутку или историю — сразу рассказывай. Ты не база данных: никаких «у меня нет в базе» ",
+    "и никаких «могу придумать, если хотите» — просто рассказывай с первой фразы. ",
+    "Умеешь открывать приложения и сайты, искать в интернете, ставить таймеры, ",
+    "работать с файлами, окнами и музыкой. Звонки, email, умный дом, покупки — не умеешь. ",
+    "Действие = один блок ",
+    "<tool>{\"name\":\"имя_инструмента\",\"args\":{...}}</tool>; на вопросы tool не нужен."
+);
+/// Системный промпт разговорной ветки под активный бэкенд.
+fn chat_system_prompt() -> &'static str {
+    if config::backend() == "uzu" {
+        UZU_CHAT_SYSTEM_PROMPT
+    } else {
+        CHAT_SYSTEM_PROMPT
+    }
+}
+
+const LLM_WAIT_TIMEOUT_SECS: u64 = 300;
+
+/// Сообщения аудио-конвейера. Определение здесь, а не в `tts`: разговорный
+/// конвейер (ask/ask_web) компилируется и там, где голосового стека нет
+/// (iOS) — канал существует, озвучку делает интерфейс, реплики не теряются.
+pub enum AudioMessage {
+    PlayWav(String),
+    SynthesizeAndPlay(String),
+    /// Превью голоса в интерфейсе: фраза синтезируется указанным диктором,
+    /// но выбранный голос приложения не меняет. В кэш не пишется.
+    PreviewVoice {
+        text: String,
+        voice: String,
+    },
+    Stop,
+}
+
+/// Диспетчер LLM-бэкендов: одинаковый потоковый интерфейс поверх candle и uzu.
+pub struct LlmEngine {
+    backend: Backend,
+}
+
+enum Backend {
+    Candle(Box<candle_backend::CandleEngine>),
+    #[cfg(target_os = "macos")]
+    Uzu(Box<uzu_backend::UzuEngine>),
+    /// Облачная модель через OpenAI-совместимый API (Яндекс GPT и другие).
+    Api(Box<api_backend::ApiEngine>),
+}
+
+impl LlmEngine {
+    /// Загрузка бэкенда по настройке `llm_backend`. Uzu существует только
+    /// на macOS; если он недоступен — откат на candle, чтобы ассистент
+    /// не оставался без мозга.
+    pub fn load(models_dir: &std::path::Path, events: &EventTx) -> Result<Self> {
+        if config::backend() == "api" {
+            match api_backend::ApiEngine::load(events) {
+                Ok(engine) => {
+                    return Ok(Self {
+                        backend: Backend::Api(Box::new(engine)),
+                    });
+                }
+                Err(e) => {
+                    // Облако выбрано явно — откат на локальную модель был бы
+                    // сюрпризом (и трафиком): честная ошибка, ключ вводится в
+                    // настройках.
+                    let _ = events.send(JarvisEvent::Error {
+                        message: format!("Облачная модель не запустилась: {e:#}"),
+                    });
+                    return Err(e);
+                }
+            }
+        }
+        if config::backend() == "uzu" {
+            #[cfg(target_os = "macos")]
+            match uzu_backend::UzuEngine::load(models_dir, events) {
+                Ok(engine) => {
+                    return Ok(Self {
+                        backend: Backend::Uzu(Box::new(engine)),
+                    });
+                }
+                Err(e) => {
+                    eprintln!("⚠️ Uzu недоступен, откатываюсь на candle: {e:#}");
+                    let _ = events.send(JarvisEvent::Log {
+                        message: format!("Uzu недоступен, включаю candle: {e}"),
+                    });
+                }
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                eprintln!("⚠️ llm_backend = \"uzu\" работает только на macOS — использую candle");
+            }
+        }
+        Ok(Self {
+            backend: Backend::Candle(Box::new(candle_backend::CandleEngine::load(models_dir)?)),
+        })
+    }
+
+    pub fn generate_streaming(
+        &mut self,
+        system: &str,
+        history: &[ChatTurn],
+        user: &str,
+        cancel: &AtomicBool,
+        on_sentence: impl FnMut(&str),
+        on_progress: impl FnMut(&str),
+    ) -> Result<String> {
+        self.generate_streaming_with_params(
+            system,
+            history,
+            user,
+            None,
+            cancel,
+            on_sentence,
+            on_progress,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn generate_streaming_with_params(
+        &mut self,
+        system: &str,
+        history: &[ChatTurn],
+        user: &str,
+        params_override: Option<config::GenerationParams>,
+        cancel: &AtomicBool,
+        on_sentence: impl FnMut(&str),
+        on_progress: impl FnMut(&str),
+    ) -> Result<String> {
+        self.generate_streaming_inner(
+            system,
+            history,
+            user,
+            params_override,
+            cancel,
+            None,
+            on_sentence,
+            on_progress,
+        )
+    }
+
+    /// Генерация с «вставленным началом ответа ассистента»: у candle `prefill`
+    /// дописывается в промпт, у uzu форсирование tool-вызова делается
+    /// JSON-грамматикой.
+    #[allow(clippy::too_many_arguments)]
+    pub fn generate_streaming_with_prefill(
+        &mut self,
+        system: &str,
+        history: &[ChatTurn],
+        user: &str,
+        params_override: Option<config::GenerationParams>,
+        cancel: &AtomicBool,
+        prefill: &str,
+        on_sentence: impl FnMut(&str),
+        on_progress: impl FnMut(&str),
+    ) -> Result<String> {
+        self.generate_streaming_inner(
+            system,
+            history,
+            user,
+            params_override,
+            cancel,
+            Some(prefill),
+            on_sentence,
+            on_progress,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn generate_streaming_inner(
+        &mut self,
+        system: &str,
+        history: &[ChatTurn],
+        user: &str,
+        params_override: Option<config::GenerationParams>,
+        cancel: &AtomicBool,
+        prefill: Option<&str>,
+        on_sentence: impl FnMut(&str),
+        on_progress: impl FnMut(&str),
+    ) -> Result<String> {
+        match &mut self.backend {
+            Backend::Candle(engine) => engine.generate_streaming_inner(
+                system,
+                history,
+                user,
+                params_override,
+                cancel,
+                prefill,
+                on_sentence,
+                on_progress,
+            ),
+            #[cfg(target_os = "macos")]
+            Backend::Uzu(engine) => engine.generate_streaming_with_params(
+                system,
+                history,
+                user,
+                params_override,
+                cancel,
+                prefill,
+                on_sentence,
+                on_progress,
+            ),
+            Backend::Api(engine) => engine.generate_streaming_with_params(
+                system,
+                history,
+                user,
+                params_override,
+                cancel,
+                prefill,
+                on_sentence,
+                on_progress,
+            ),
+        }
+    }
+}
+
+/// Какая модель **фактически** загружена и отвечает. Источник правды для UI:
+/// настройка может говорить «облако», но пока загрузка не удалась, отвечать
+/// некому — и интерфейс должен это видеть, а не угадывать по settings.toml.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct BackendInfo {
+    /// "uzu" | "candle" | "api".
+    pub backend: String,
+    /// Пресет облака ("yandex" | "gigachat" | "openai"), пусто для локальных.
+    pub preset: String,
+    /// Имя модели: локальный каталог или модель у провайдера.
+    pub model: String,
+}
+
+pub struct SharedLlmState {
+    pub engine: Mutex<Option<LlmEngine>>,
+    pub condvar: Condvar,
+    pub failed: AtomicBool,
+    /// Поколение загрузчика: смена llm_backend/llm_model в настройках
+    /// увеличивает счётчик — старый загрузчик (например, качающий модель
+    /// uzu) видит устаревшее поколение и не записывает свой движок.
+    pub generation: AtomicU64,
+    /// Фактически загруженный бэкенд. None — готового движка нет.
+    pub active: Mutex<Option<BackendInfo>>,
+    /// Есть ли в слоте готовый движок — «зеркало» наличия движка.
+    ///
+    /// Отдельный флаг нужен, потому что `engine` — мьютекс, который
+    /// УДЕРЖИВАЕТСЯ ВСЮ ГЕНЕРАЦИЮ. Любая проверка готовности через
+    /// `engine.lock()` (а так проверяет и статус в интерфейсе) встаёт
+    /// в очередь за модель: опрос статуса каждые две секунды висел на
+    /// этом мьютексе до конца ответа, и IPC-канал забивался — интерфейс
+    /// не отвечал, пока Джарвис думал. Флаг читается без блокировки.
+    pub ready: AtomicBool,
+}
+
+pub type SharedLlm = Arc<SharedLlmState>;
+
+impl SharedLlmState {
+    pub fn new() -> Self {
+        Self {
+            engine: Mutex::new(None),
+            condvar: Condvar::new(),
+            failed: AtomicBool::new(false),
+            generation: AtomicU64::new(1),
+            active: Mutex::new(None),
+            ready: AtomicBool::new(false),
+        }
+    }
+}
+
+impl Default for SharedLlmState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Убрать движок из слота. Обязательный шаг при неудачной перезагрузке
+/// (например, облако не запустилось): иначе в слоте остаётся прежняя
+/// локальная модель, `wait_for_engine` мгновенно возвращает её, и выбранное
+/// облако молча подменялось «тупым» локальным ответом.
+fn discard_engine(shared: &SharedLlm) {
+    let had_engine = {
+        let mut guard = shared.engine.lock().unwrap_or_else(|e| e.into_inner());
+        guard.take().is_some()
+    };
+    *shared.active.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    shared.ready.store(false, Ordering::SeqCst);
+    if had_engine {
+        println!("🗑 Слот LLM очищен: предыдущий движок больше не отвечает");
+    }
+    shared.condvar.notify_all();
+}
+
+/// Какая модель фактически отвечает (для статуса и UI). None — движок не готов.
+pub fn active_backend(shared: &SharedLlm) -> Option<BackendInfo> {
+    shared
+        .active
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
+}
+
+/// Последнее установленное значение яркости: платформенный слой яркость
+/// только ставит, геттера нет, а «сделай ярче» нужно от чего-то считать.
+static LAST_BRIGHTNESS: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(50);
+
+/// Процент громкости/яркости из фразы: «поставь громкость на 30»,
+/// «громкость 30», «яркость 50 процентов». Числа словами STT пишет цифрами;
+/// для «громче/тише» есть дельта от текущего уровня, это не сюда.
+fn percent_from_prompt(t: &str) -> Option<u8> {
+    t.split(|c: char| !c.is_alphanumeric())
+        .find_map(|w| w.parse::<u8>().ok().filter(|p| *p <= 100))
+}
+
+/// Честное сообщение, почему модель сейчас не ответит: загрузка не удалась
+/// или ещё идёт. Формулировка — под выбранный бэкенд, чтобы подсказка была
+/// действием («проверь ключ»), а не общей «модель грузится». Базовые
+/// команды без нейросети работают в любом случае — об этом говорим явно.
+fn engine_unavailable_message(shared: &SharedLlm) -> &'static str {
+    if shared.failed.load(Ordering::SeqCst) {
+        if config::backend() == "api" {
+            "Облачная модель не запустилась: проверь ключ и настройки провайдера."
+        } else {
+            "Модель не загрузилась: проверь выбор модели в настройках."
+        }
+    } else {
+        "Модель ещё загружается. Команды без нейросети — время, таймеры, громкость, \
+         окна, погода — работают уже сейчас."
+    }
+}
+
+/// Движок недоступен (failed или не дождались): события + голосовая реплика.
+fn report_engine_unavailable(
+    shared: &SharedLlm,
+    events: &EventTx,
+    audio_tx: &Sender<AudioMessage>,
+) {
+    let message = engine_unavailable_message(shared);
+    let _ = events.send(JarvisEvent::Error {
+        message: message.into(),
+    });
+    let _ = audio_tx.send(AudioMessage::SynthesizeAndPlay(message.into()));
+}
+
+/// Базовые команды, НЕ требующие нейросети: время, погода, громкость,
+/// яркость, скриншот, чтение экрана, блокировка, буфер обмена, уведомления.
+/// Исполняются напрямую платформенным слоем и tools::execute — модель не
+/// участвует вовсе, в том числе пока она грузится или не скачана (репорт
+/// 2026-11-21: «базовую задачу не могу сделать без нейросети, подождите
+/// модель загружается»). Таймеры, будильник, утилиты и команды пользователя
+/// перехватываются раньше и без этого слоя.
+fn basic_command_answer(
+    prompt: &str,
+    audio_tx: &Sender<AudioMessage>,
+    events: &EventTx,
+) -> Option<String> {
+    let t = prompt.to_lowercase();
+    let said = |words: &[&str]| words.iter().any(|w| t.contains(w));
+    let finish = |speech: String| -> String {
+        let _ = events.send(JarvisEvent::LlmDone {
+            text: speech.clone(),
+        });
+        speech
+    };
+    // Прямое исполнение инструмента с голосом и событиями, как в agent-цикле.
+    let run = |call: crate::tools::ToolCall| -> String {
+        let outcome = crate::tools::execute(call, audio_tx, events);
+        outcome.speech
+    };
+
+    // Время суток: часы без даты — мгновенно, без кривых ответов 2B.
+    if said(&["сколько времени", "который час", "какое сейчас время"])
+    {
+        let now = chrono::Local::now();
+        return Some(finish(format!("Сейчас {}.", now.format("%H:%M"))));
+    }
+
+    // Погода: нужен только доступ в сеть, не мозг. Город — из фразы,
+    // иначе из настроек (weather_city, по умолчанию Москва).
+    if crate::weather::is_weather_question(prompt) {
+        let city = crate::weather::extract_city(prompt)
+            .or_else(|| {
+                crate::settings::Settings::load(&crate::paths::settings_file())
+                    .ok()
+                    .map(|s| s.weather_city)
+            })
+            .filter(|c| !c.trim().is_empty())
+            .unwrap_or_else(|| "Москва".to_string());
+        return Some(finish(match crate::weather::fetch(&city) {
+            Ok(w) => crate::weather::speak_answer(&w),
+            Err(e) => format!("Погоду не узнал: {e:#}."),
+        }));
+    }
+
+    // Громкость: явное число, «выключи звук», «громче/тише» — шаг ±10 от
+    // текущего уровня. Императивы обязательны, чтобы «какая громкость?»
+    // не меняла звук.
+    if said(&["громче", "тише", "громкость", "звук"])
+        && said(&[
+            "сделай",
+            "поставь",
+            "установи",
+            "увеличь",
+            "уменьши",
+            "прибавь",
+            "убавь",
+            "выключи",
+            "включи",
+        ])
+    {
+        if said(&["выключи звук"]) {
+            return Some(finish(run(crate::tools::ToolCall::SetVolume {
+                percent: 0,
+            })));
+        }
+        if said(&["включи звук"]) {
+            // Включаем на разумном уровне: точного прежнего значения нет.
+            return Some(finish(run(crate::tools::ToolCall::SetVolume {
+                percent: 50,
+            })));
+        }
+        if let Some(percent) = percent_from_prompt(&t) {
+            return Some(finish(run(crate::tools::ToolCall::SetVolume { percent })));
+        }
+        let delta: i16 = if said(&["громче", "прибавь", "увеличь"]) {
+            10
+        } else if said(&["тише", "убавь", "уменьши"]) {
+            -10
+        } else {
+            0
+        };
+        if delta != 0 {
+            let current = crate::platform::get_volume().unwrap_or(50) as i16;
+            let percent = (current + delta).clamp(0, 100) as u8;
+            return Some(finish(run(crate::tools::ToolCall::SetVolume { percent })));
+        }
+    }
+
+    // Яркость — та же схема; геттера яркости в платформенном слое нет,
+    // для дельты держим последнее установленное значение.
+    if said(&["ярче", "темнее", "яркость"])
+        && said(&[
+            "сделай",
+            "поставь",
+            "установи",
+            "увеличь",
+            "уменьши",
+            "прибавь",
+            "убавь",
+        ])
+    {
+        let percent = percent_from_prompt(&t).unwrap_or_else(|| {
+            let delta: i16 = if said(&["ярче", "прибавь", "увеличь"]) {
+                10
+            } else if said(&["темнее", "убавь", "уменьши"]) {
+                -10
+            } else {
+                0
+            };
+            (LAST_BRIGHTNESS.load(Ordering::Relaxed) as i16 + delta).clamp(0, 100) as u8
+        });
+        LAST_BRIGHTNESS.store(percent, Ordering::Relaxed);
+        return Some(finish(run(crate::tools::ToolCall::SetBrightness {
+            percent,
+        })));
+    }
+
+    // Скриншот.
+    if said(&["скриншот", "снимок экрана"]) {
+        return Some(finish(run(crate::tools::ToolCall::Screenshot)));
+    }
+
+    // Блокировка и сон: «заблокируй» без «окна» (окна — это window-план).
+    if said(&["заблокируй", "заблокируй экран"]) && !t.contains("окно")
+    {
+        return Some(finish(run(crate::tools::ToolCall::LockScreen)));
+    }
+    if said(&["спящий режим", "усыпь"]) {
+        return Some(finish(run(crate::tools::ToolCall::Sleep)));
+    }
+
+    // Экран текстом: без модели голосом говорим заголовок (приложение и
+    // окно) и число элементов, полный дамп — в интерфейс событием LlmDone.
+    if said(&[
+        "что на экране",
+        "прочитай экран",
+        "текст с экрана",
+        "что видно на экране",
+    ]) {
+        return Some(finish(match crate::auto::describe_screen() {
+            Ok(text) => {
+                let elements = text
+                    .lines()
+                    .filter(|l| l.trim_start().starts_with('['))
+                    .count();
+                let head = text.lines().next().unwrap_or("Экран пуст.").to_string();
+                let _ = events.send(JarvisEvent::LlmDone { text });
+                format!("{head}. Элементов {elements} — полный список в интерфейсе.")
+            }
+            Err(e) => format!("Экран прочитать не удалось: {e:#}."),
+        }));
+    }
+
+    // Буфер обмена.
+    if said(&["буфер"]) && said(&["прочитай", "что в буфере", "покажи"])
+    {
+        return Some(finish(run(crate::tools::ToolCall::ClipboardRead)));
+    }
+    if let Some(text) = after_marker(
+        prompt,
+        &["скопируй в буфер", "запиши в буфер", "сохрани в буфер"],
+    ) {
+        if !text.trim().is_empty() {
+            return Some(finish(run(crate::tools::ToolCall::ClipboardWrite {
+                text: text.trim().to_string(),
+            })));
+        }
+    }
+
+    // Уведомление на экране: «уведомь меня: встреча в восемь».
+    if let Some(text) = after_marker(prompt, &["уведомь", "уведомление:", "покажи уведомление"])
+    {
+        let text = text.trim();
+        if !text.is_empty() {
+            return Some(finish(run(crate::tools::ToolCall::Notify {
+                title: "Джарвис".to_string(),
+                body: text.to_string(),
+            })));
+        }
+    }
+
+    None
+}
+
+/// Текст после маркера фразы («уведомь», «запиши в буфер»): всё, что
+/// дальше, из ИСХОДНОЙ строки — регистр сохраняется. Маркер ищется в
+/// нижнерегистровой копии, позиция переводится в индексы исходной. None —
+/// маркера нет или после него пусто.
+fn after_marker(original: &str, markers: &[&str]) -> Option<String> {
+    let lower = original.to_lowercase();
+    for marker in markers {
+        if let Some(pos) = lower.find(marker) {
+            let start_chars = lower[..pos].chars().count() + marker.chars().count();
+            let rest: String = original.chars().skip(start_chars).collect();
+            let trimmed = rest.trim_start_matches(|c: char| {
+                c == ':' || c == ' ' || c == ',' || c == '—' || c == '-'
+            });
+            // Служебные слова после маркера («уведомь меня: …») не часть
+            // текста — срезаем первое слово целиком, регистр не важен.
+            let mut out = trimmed.to_string();
+            loop {
+                let first_word: String = out
+                    .chars()
+                    .take_while(|c| c.is_alphanumeric())
+                    .collect::<String>()
+                    .to_lowercase();
+                if !["меня", "мне", "про", "что"].contains(&first_word.as_str()) {
+                    break;
+                }
+                let word_len = first_word.chars().count();
+                out = out
+                    .chars()
+                    .skip(word_len)
+                    .collect::<String>()
+                    .trim_start_matches(|c: char| c.is_whitespace() || c == ':')
+                    .to_string();
+            }
+            if !out.trim().is_empty() {
+                return Some(out);
+            }
+        }
+    }
+    None
+}
+
+pub fn spawn_llm_loader(shared: &SharedLlm, events: &EventTx) {
+    let shared = Arc::clone(shared);
+    let events = events.clone();
+
+    std::thread::spawn(move || {
+        let generation = shared.generation.load(Ordering::SeqCst);
+        let _ = events.send(JarvisEvent::LlmStatus {
+            status: "loading".into(),
+        });
+
+        let loaded = LlmEngine::load(&crate::paths::models_dir(), &events);
+        if shared.generation.load(Ordering::SeqCst) != generation {
+            // Пока грузились, выбрали другой бэкенд/модель: этот движок
+            // устарел — не прогреваем и не записываем (загрузку запустил
+            // свежий поток).
+            println!("↩️ Загрузчик LLM устарел (сменился бэкенд/модель) — выхожу");
+            return;
+        }
+        match loaded {
+            Ok(mut engine) => {
+                // Прогрев Metal-шейдеров на коротком промпте.
+                let cancel = Arc::new(AtomicBool::new(false));
+                let warm_params = config::GenerationParams {
+                    temperature: 0.0,
+                    top_p: 1.0,
+                    max_tokens: 16,
+                    ..Default::default()
+                };
+                let started = std::time::Instant::now();
+                let _ = engine.generate_streaming_with_params(
+                    CHAT_SYSTEM_PROMPT,
+                    &[],
+                    "Привет",
+                    Some(warm_params),
+                    &cancel,
+                    |_| {},
+                    |_| {},
+                );
+                println!("🔥 LLM прогрета за {:.1?}", started.elapsed());
+
+                if shared.generation.load(Ordering::SeqCst) != generation {
+                    println!("↩️ Загрузчик LLM устарел после прогрева — выхожу");
+                    return;
+                }
+                let info = BackendInfo {
+                    backend: config::backend(),
+                    preset: (config::backend() == "api")
+                        .then(config::api_preset)
+                        .unwrap_or_default(),
+                    model: if config::backend() == "api" {
+                        config::api_model()
+                    } else {
+                        config::model_name()
+                    },
+                };
+                *shared.active.lock().unwrap_or_else(|e| e.into_inner()) = Some(info);
+                let mut guard = shared.engine.lock().unwrap_or_else(|e| e.into_inner());
+                *guard = Some(engine);
+                drop(guard);
+                // Готовность — отдельным флагом: читать его можно, не
+                // вставая в очередь за мьютекс движка (он занят всей
+                // генерацией).
+                shared.ready.store(true, Ordering::SeqCst);
+                shared.condvar.notify_all();
+                let _ = events.send(JarvisEvent::LlmStatus {
+                    status: "ready".into(),
+                });
+            }
+            Err(e) => {
+                eprintln!("❌ Ошибка загрузки LLM: {e:#}");
+                // Убираем прежний движок: после неудачной загрузки выбранного
+                // бэкенда ассистент обязан молчать с честной ошибкой, а не
+                // продолжать отвечать оставшейся в слоте старой моделью.
+                discard_engine(&shared);
+                shared.failed.store(true, Ordering::SeqCst);
+                shared.condvar.notify_all();
+                let _ = events.send(JarvisEvent::LlmStatus {
+                    status: "failed".into(),
+                });
+            }
+        }
+    });
+}
+
+/// Перезагрузка LLM на лету: смена бэкенда/модели в настройках.
+/// Старый загрузчик отваливается по поколению (см. SharedLlmState.generation).
+pub fn reload_llm(shared: &SharedLlm, events: &EventTx) {
+    shared.generation.fetch_add(1, Ordering::SeqCst);
+    shared.failed.store(false, Ordering::SeqCst);
+    spawn_llm_loader(shared, events);
+}
+
+fn wait_for_engine(
+    shared: &SharedLlm,
+    timeout: Duration,
+) -> Option<MutexGuard<'_, Option<LlmEngine>>> {
+    let guard = shared.engine.lock().unwrap_or_else(|e| e.into_inner());
+    let (guard, _) = shared
+        .condvar
+        .wait_timeout_while(guard, timeout, |engine| {
+            engine.is_none() && !shared.failed.load(Ordering::SeqCst)
+        })
+        .unwrap_or_else(|e| e.into_inner());
+
+    if guard.is_none() {
+        eprintln!("❌ Не дождался готовности LLM за {:?}", timeout);
+        None
+    } else {
+        Some(guard)
+    }
+}
+/// Задать вопрос LLM. Не блокирует: генерация идёт в фоне.
+/// Запустить обработку просьбы в фоне. Возвращает поток обработки, чтобы
+/// одноразовые режимы (CLI `--say`) могли дождаться конца действия;
+/// обычный голосовой цикл поток не ждёт и просто игнорирует возврат.
+pub fn ask(
+    shared: SharedLlm,
+    system: &'static str,
+    prompt: String,
+    history: Arc<Mutex<Vec<ChatTurn>>>,
+    audio_tx: Sender<AudioMessage>,
+    events: EventTx,
+    cancel: Arc<AtomicBool>,
+) -> Option<std::thread::JoinHandle<()>> {
+    // Детерминированный план системной команды: «открой Max», «сверни окно
+    // голосового помощника», «закрой телеграм». Считаем ДО кэша сайтов,
+    // иначе установленное приложение проигрывает запомненному домену.
+    // Явные команды пользователя из commands.toml важнее общей эвристики.
+    let plan = if system == CHAT_SYSTEM_PROMPT
+        && crate::tools::utils_tab_for_prompt(&prompt).is_none()
+        && !crate::commands::matches_user_command(&prompt)
+    {
+        router::plan_system_command(&prompt)
+    } else {
+        None
+    };
+
+    // Обучаемый кэш: этот сайт уже разрешали раньше — открываем мгновенно,
+    // вообще не поднимая модель.
+    if plan.is_none()
+        && system == CHAT_SYSTEM_PROMPT
+        && router::classify(&prompt) == router::Intent::Action
+        && !router::reads_state(&prompt)
+        && let Some(url) =
+            crate::site_cache::lookup(&crate::tool_guard::strip_browser_phrase(&prompt).0)
+    {
+        println!("⚡ Кэш сайта: {prompt} → {url}");
+        // Через общий путь исполнения: события ActionStarted/ActionResult,
+        // та же речь и тот же формат, что у open_url из модели.
+        let outcome = tools::execute(
+            tools::ToolCall::OpenUrl {
+                url,
+                browser: crate::tool_guard::browser_in_text(&prompt),
+            },
+            &audio_tx,
+            &events,
+        );
+        let _ = audio_tx.send(AudioMessage::SynthesizeAndPlay(outcome.speech.clone()));
+        let _ = events.send(JarvisEvent::LlmDone {
+            text: outcome.speech,
+        });
+        ask_done();
+        return None;
+    }
+
+    Some(std::thread::spawn(move || {
+        let _ = events.send(JarvisEvent::LlmStatus {
+            status: "thinking".into(),
+        });
+
+        // Календарные вопросы считаем сами: мгновенно и без кривых tool-блоков
+        // от модели («какой сейчас год» → «Сегодня 2026 год.»).
+        if let Some(answer) = crate::text::calendar_answer(&prompt) {
+            println!("📅 Календарь: {answer}");
+            let _ = audio_tx.send(AudioMessage::SynthesizeAndPlay(answer.clone()));
+            let _ = events.send(JarvisEvent::LlmDone { text: answer });
+            return;
+        }
+
+        // Проценты тоже считаем сами: арифметика 2B плавает
+        // (то 360, то 636 на одном и том же «15 процентов от 2400»).
+        if let Some(answer) = crate::text::percent_answer(&prompt) {
+            println!("🧮 Проценты: {answer}");
+            let _ = audio_tx.send(AudioMessage::SynthesizeAndPlay(answer.clone()));
+            let _ = events.send(JarvisEvent::LlmDone { text: answer });
+            return;
+        }
+
+        // «Поставь таймер на двадцать секунд» — мгновенно и без модели:
+        // длительность разбираем сами (числа-слова STT пишет словами),
+        // хаб ставит таймер, окно утилит открывается по событию.
+        // Стоп-глаголы («отмени таймер») — тоже без модели: 2B в
+        // разговорной ветке вместо timer_stop отвечала текстом «отменила»,
+        // ничего не отменяя. «Смени/поменяй» — замена старого, а не
+        // второй таймер рядом.
+        let lower = prompt.to_lowercase();
+        let stop_verbs = ["останови", "отмени", "сними", "убери", "выключи", "стоп"];
+        let stops_timer = stop_verbs.iter().any(|w| lower.contains(w));
+        if system == CHAT_SYSTEM_PROMPT && lower.contains("таймер") {
+            if stops_timer {
+                println!("⏱ Быстрая отмена таймера");
+                let speech = match crate::timers::cancel(&events, &audio_tx, None, None) {
+                    Some(timer) => {
+                        let what = if timer.kind == crate::timers::TimerKind::Alarm {
+                            "будильник"
+                        } else {
+                            "таймер"
+                        };
+                        // Быстрые таймеры ставятся без имени — кавычки с
+                        // пустотой не озвучиваем.
+                        let named = if timer.label.is_empty() {
+                            what.to_string()
+                        } else {
+                            format!("{what} «{}»", timer.label)
+                        };
+                        if timer.ringing {
+                            format!("Остановил {named}.")
+                        } else {
+                            format!(
+                                "Остановил {named} (оставалось {}).",
+                                crate::tools::humanize_seconds(timer.remaining_secs)
+                            )
+                        }
+                    }
+                    None => "Активных таймеров нет.".to_string(),
+                };
+                let _ = audio_tx.send(AudioMessage::SynthesizeAndPlay(speech.clone()));
+                let _ = events.send(JarvisEvent::LlmDone { text: speech });
+                return;
+            }
+            if let Some(secs) = crate::text::parse_duration(&prompt) {
+                let replace_verbs = ["смени", "поменяй", "переделай", "перезапусти", "заново"];
+                let replace = replace_verbs.iter().any(|w| lower.contains(w));
+                if replace {
+                    for timer in crate::timers::active() {
+                        if timer.kind == crate::timers::TimerKind::Timer {
+                            crate::timers::cancel(
+                                &events,
+                                &audio_tx,
+                                Some(crate::timers::TimerKind::Timer),
+                                Some(timer.id),
+                            );
+                        }
+                    }
+                }
+                let speech = format!(
+                    "Поставил таймер на {}.",
+                    crate::tools::humanize_seconds(secs)
+                );
+                println!(
+                    "⏱ Быстрый таймер: {secs} с{}",
+                    if replace { " (с заменой)" } else { "" }
+                );
+                crate::timers::start(
+                    &events,
+                    &audio_tx,
+                    "",
+                    secs,
+                    crate::timers::TimerKind::Timer,
+                );
+                let _ = audio_tx.send(AudioMessage::SynthesizeAndPlay(speech.clone()));
+                let _ = events.send(JarvisEvent::LlmDone { text: speech });
+                return;
+            }
+        }
+
+        // «Открой утилиты» / «закрой утилиты» — окно Джарвиса, решаем сами.
+        // Без этого фраза уезжала в LLM, а в каталоге у неё был только
+        // close_utils — и «открой» выполнялось наоборот.
+        if system == CHAT_SYSTEM_PROMPT
+            && let Some(closing) = crate::tools::utils_window_request(&prompt)
+        {
+            let speech = if closing {
+                let _ = events.send(JarvisEvent::CloseUtils);
+                "Закрыл утилиты."
+            } else {
+                let tab = crate::tools::utils_tab_for_prompt(&prompt)
+                    .map(crate::tools::UtilsTab::parse)
+                    .unwrap_or(crate::tools::UTILS_DEFAULT_TAB);
+                let _ = events.send(JarvisEvent::OpenUtils {
+                    tab: tab.as_str().to_string(),
+                });
+                "Открыл утилиты."
+            };
+            println!("🧰 {speech}");
+            let _ = audio_tx.send(AudioMessage::SynthesizeAndPlay(speech.to_string()));
+            let _ = events.send(JarvisEvent::LlmDone {
+                text: speech.to_string(),
+            });
+            return;
+        }
+
+        // «Проиграй анимацию реактора» — просьба к интерфейсу: сыграть
+        // заставку ещё раз. Здесь нечего спрашивать у модели.
+        if system == CHAT_SYSTEM_PROMPT && crate::tools::reactor_intro_request(&prompt) {
+            let speech = "Проиграю сборку реактора.";
+            let _ = events.send(JarvisEvent::ReactorIntro);
+            println!("⚙️ {speech}");
+            let _ = audio_tx.send(AudioMessage::SynthesizeAndPlay(speech.to_string()));
+            let _ = events.send(JarvisEvent::LlmDone {
+                text: speech.to_string(),
+            });
+            return;
+        }
+
+        // Быстрый путь утилит: календарь/секундомер/таймер — окно Джарвиса,
+        // не системные приложения и не LLM. Стоп-глаголы отменяют таймер.
+        if system == CHAT_SYSTEM_PROMPT
+            && let Some(tab) = crate::tools::utils_tab_for_prompt(&prompt)
+        {
+            let t = prompt.to_lowercase();
+            let stopping = ["останови", "отмени", "сними", "убери", "выключи"]
+                .iter()
+                .any(|w| t.contains(w));
+            if stopping && tab == "timer" {
+                let speech = match crate::timers::cancel(
+                    &events,
+                    &audio_tx,
+                    Some(crate::timers::TimerKind::Timer),
+                    None,
+                ) {
+                    Some(timer) => {
+                        if timer.label.is_empty() {
+                            "Остановил таймер.".to_string()
+                        } else {
+                            format!("Остановил таймер «{}».", timer.label)
+                        }
+                    }
+                    None => "Активных таймеров нет.".to_string(),
+                };
+                println!("⏹ {speech}");
+                let _ = audio_tx.send(AudioMessage::SynthesizeAndPlay(speech.clone()));
+                let _ = events.send(JarvisEvent::LlmDone { text: speech });
+                return;
+            }
+            let name = match tab {
+                "calendar" => "Календарь",
+                "stopwatch" => "Секундомер",
+                _ => "Таймер",
+            };
+            println!("🧰 Открываю утилиты: {name}");
+            let _ = events.send(JarvisEvent::OpenUtils {
+                tab: tab.to_string(),
+            });
+            let _ = audio_tx.send(AudioMessage::SynthesizeAndPlay(format!("Открываю {name}")));
+            let _ = events.send(JarvisEvent::LlmDone {
+                text: format!("Открыл {name}"),
+            });
+            return;
+        }
+
+        // «Останови/выключи будильник» — глушим сигнал будильника.
+        if system == CHAT_SYSTEM_PROMPT {
+            let t = prompt.to_lowercase();
+            let mentions_alarm = t.contains("будильник") || t.contains("alarm");
+            let stopping_alarm = [
+                "останови",
+                "отмени",
+                "сними",
+                "убери",
+                "выключи",
+                "заглуши",
+                "стоп",
+            ]
+            .iter()
+            .any(|w| t.contains(w));
+            if mentions_alarm && stopping_alarm {
+                let speech = match crate::timers::cancel(
+                    &events,
+                    &audio_tx,
+                    Some(crate::timers::TimerKind::Alarm),
+                    None,
+                ) {
+                    Some(alarm) if !alarm.label.is_empty() => {
+                        format!("Остановил будильник «{}».", alarm.label)
+                    }
+                    Some(_) => "Остановил будильник.".to_string(),
+                    None => "Будильник не звонит.".to_string(),
+                };
+                println!("⏹ {speech}");
+                let _ = audio_tx.send(AudioMessage::SynthesizeAndPlay(speech.clone()));
+                let _ = events.send(JarvisEvent::LlmDone { text: speech });
+                return;
+            }
+        }
+
+        // Базовые команды без нейросети: время, погода, громкость, яркость,
+        // скриншот, экран, блокировка, буфер, уведомления. Работают при любом
+        // состоянии модели — в том числе пока та грузится или не скачана.
+        if system == CHAT_SYSTEM_PROMPT
+            && let Some(speech) = basic_command_answer(&prompt, &audio_tx, &events)
+        {
+            println!("⚡ Базовая команда без нейросети");
+            let _ = audio_tx.send(AudioMessage::SynthesizeAndPlay(speech.clone()));
+            let _ = events.send(JarvisEvent::LlmDone { text: speech });
+            return;
+        }
+
+        // Детерминированный план: приложение, файл, папка, сайт, окно или
+        // выход приложения — выполняем без модели и без подмены объекта.
+        if let Some(call) = plan {
+            println!("🧭 План: {call:?}");
+            let outcome = tools::execute(call, &audio_tx, &events);
+            speak(&audio_tx, &events, &outcome.speech);
+            return;
+        }
+
+        // Обучаемая память команд: та же (или почти та же) фраза уже
+        // выполнялась успешно — воспроизводим мгновенно, без LLM.
+        // Память не узнала — обычный путь: план, модель.
+        if let Some(call) = crate::learned::lookup(&prompt) {
+            let outcome = tools::execute(call, &audio_tx, &events);
+            speak(&audio_tx, &events, &outcome.speech);
+            return;
+        }
+
+        // Быстрый путь «открой X» убран: он разрешал «яндекс карты» → Maps по
+        // суффиксу, игнорируя контекст. Приложение vs сайт теперь решает LLM:
+        // open_app/open_url/run_command (каталог команд) с контекстом фразы.
+
+        let verdict = router::classify_detailed(&prompt);
+        let is_action = system == CHAT_SYSTEM_PROMPT && verdict.intent == router::Intent::Action;
+
+        // «Исследуй…» / «проведи расследование…» — глубокий разбор с
+        // несколькими поисками: та же агентная машина, другой промпт.
+        if system == CHAT_SYSTEM_PROMPT && router::is_research_request(&prompt) {
+            run_action(
+                &shared,
+                &format!(
+                    "{}\nСегодняшняя дата: {}.",
+                    RESEARCH_SYSTEM_PROMPT,
+                    crate::text::today_russian()
+                ),
+                &prompt,
+                verdict.confidence,
+                &audio_tx,
+                &events,
+                &cancel,
+                &history,
+            );
+            return;
+        }
+
+        if is_action {
+            let system = router::action_prompt_for(&prompt);
+            run_action(
+                &shared,
+                &system,
+                &prompt,
+                verdict.confidence,
+                &audio_tx,
+                &events,
+                &cancel,
+                &history,
+            );
+            return;
+        }
+
+        let effective_system = if system == WEB_SYSTEM_PROMPT {
+            format!(
+                "{system}\nСегодняшняя дата: {}.",
+                crate::text::today_russian()
+            )
+        } else {
+            // Разговорная ветка: каталог команд подмешиваем снова — дословный
+            // fuzzy-матч команд убран из движка, и без имён в контексте модель
+            // не узнает, какой run_command вызвать по смыслу. Каталог пустой —
+            // блок не добавляем, чтобы не тратить префилл.
+            let chat = chat_system_prompt();
+            let catalog = crate::commands::prompt_catalog();
+            let commands_block = if catalog.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    "\n\nКОМАНДЫ ПОЛЬЗОВАТЕЛЯ (совпало по смыслу — вызывай run_command):\n{catalog}\n  run_command {{\"name\":\"имя\",\"args\":{{\"параметр\":\"значение\"}}}}"
+                )
+            };
+            format!(
+                "{chat}\nСегодняшняя дата: {}.\n{commands_block}{}\nЕсли просьба совпадает с командой пользователя, \
+                 вызови run_command с её именем; иначе просто ответь.",
+                crate::text::today_russian(),
+                crate::memory::prompt_block()
+            )
+        };
+
+        let history_snapshot: Vec<ChatTurn> = {
+            let buf = history.lock().unwrap_or_else(|e| e.into_inner());
+            buf.iter()
+                .rev()
+                .take(MAX_HISTORY_ENTRIES)
+                .rev()
+                .cloned()
+                .collect()
+        };
+
+        // Неудачная загрузка выбранного бэкенда — честный отказ сразу, без
+        // ожидания: слот пуст, ждать нечего, а реплика подскажет, что чинить.
+        if shared.failed.load(Ordering::SeqCst) {
+            report_engine_unavailable(&shared, &events, &audio_tx);
+            return;
+        }
+
+        let Some(mut guard) = wait_for_engine(&shared, Duration::from_secs(LLM_WAIT_TIMEOUT_SECS))
+        else {
+            report_engine_unavailable(&shared, &events, &audio_tx);
+            return;
+        };
+
+        let Some(engine) = guard.as_mut() else {
+            return;
+        };
+
+        // Лимита на длину нет (Default max_tokens = 0): разбор длинного
+        // вопроса по результатам поиска не обрывается на полуслове.
+        let web_params = (system == WEB_SYSTEM_PROMPT).then(|| config::GenerationParams {
+            temperature: 0.2,
+            ..Default::default()
+        });
+
+        let started = std::time::Instant::now();
+        let mut text = match engine.generate_streaming_with_params(
+            &effective_system,
+            &history_snapshot,
+            &prompt,
+            web_params.clone(),
+            &cancel,
+            |sentence| {
+                let _ = audio_tx.send(AudioMessage::SynthesizeAndPlay(sentence.to_string()));
+            },
+            |full| {
+                let _ = events.send(JarvisEvent::LlmChunk {
+                    text: full.to_string(),
+                });
+            },
+        ) {
+            Ok(t) => t,
+            Err(e) => {
+                drop(guard);
+                eprintln!("⚠️ Ошибка генерации LLM: {e}");
+                let _ = events.send(JarvisEvent::Error {
+                    message: format!("Ошибка LLM: {e}"),
+                });
+                let _ = audio_tx.send(AudioMessage::SynthesizeAndPlay(
+                    "Не получилось ответить: модель вернула ошибку.".into(),
+                ));
+                return;
+            }
+        };
+
+        // Модель 2B иногда отвечает на обычный вопрос кривым tool-блоком
+        // (без поля name и т.п.). Разговорная ветка — это вопросы: один раз
+        // просим ответить текстом, и только при повторной неудаче звучит
+        // «не смог разобрать команду».
+        if matches!(tools::parse(&text), tools::ToolParse::Failed(_))
+            && text.trim_start().starts_with("<tool>")
+        {
+            println!("↩️ Вопрос отвечен tool-блоком — переспрашиваю текстом");
+            println!("🧩 Не разобранный tool-блок: {text}");
+            let mut nudge_history = history_snapshot.clone();
+            nudge_history.push((prompt.clone(), text.clone()));
+            if let Ok(second) = engine.generate_streaming_with_params(
+                &effective_system,
+                &nudge_history,
+                "Это вопрос, а не действие. Ответь обычным текстом по-русски, без tool-блоков.",
+                web_params,
+                &cancel,
+                |sentence| {
+                    let _ = audio_tx.send(AudioMessage::SynthesizeAndPlay(sentence.to_string()));
+                },
+                |full| {
+                    let _ = events.send(JarvisEvent::LlmChunk {
+                        text: full.to_string(),
+                    });
+                },
+            ) {
+                text = second;
+            }
+        }
+        drop(guard);
+
+        println!(
+            "🤖 Ответ LLM за {:.1?} ({} симв.)",
+            started.elapsed(),
+            text.chars().count()
+        );
+        // В разговорном режиме модель тоже может вызвать инструмент —
+        // пользовательские команды из каталога.
+        let parsed = match tools::parse(&text) {
+            tools::ToolParse::None => tools::parse_bare(&text),
+            other => other,
+        };
+        if let tools::ToolParse::Call(mut call) = parsed {
+            // Как в run_action: web_search без запроса — запрос есть фраза.
+            if let tools::ToolCall::WebSearch { query } = &mut call
+                && query.trim().is_empty()
+            {
+                *query = prompt.clone();
+            }
+            let outcome = tools::execute(call.clone(), &audio_tx, &events);
+            // Читающие инструменты возвращают ДАННЫЕ: итоговый ответ
+            // собирает модель по ним. Сырая речь инструмента («Нашёл 5
+            // результатов») без сводки — обрыв, а не ответ.
+            let returns_data = matches!(
+                call,
+                tools::ToolCall::WebSearch { .. }
+                    | tools::ToolCall::FileRead { .. }
+                    | tools::ToolCall::FileList { .. }
+                    | tools::ToolCall::FileSearch { .. }
+                    | tools::ToolCall::FileGlob { .. }
+                    | tools::ToolCall::ClipboardRead
+                    | tools::ToolCall::SystemInfo
+                    | tools::ToolCall::TaskList
+                    | tools::ToolCall::ScheduleList
+                    | tools::ToolCall::UiRead
+                    | tools::ToolCall::ScreenRead
+                    | tools::ToolCall::RunCommand { .. }
+            );
+            let speech = if outcome.ok && returns_data {
+                match wait_for_engine(&shared, Duration::from_secs(LLM_WAIT_TIMEOUT_SECS)) {
+                    Some(mut guard) => {
+                        let system_for_summary = match call {
+                            tools::ToolCall::WebSearch { .. } => format!(
+                                "{}\nСегодняшняя дата: {}.",
+                                WEB_SYSTEM_PROMPT,
+                                crate::text::today_russian()
+                            ),
+                            _ => effective_system.clone(),
+                        };
+                        let ask = format!(
+                            "Результат инструмента:\n{}\n\nВопрос пользователя: {prompt}. \
+                             Ответь коротко по существу на его основе, без упоминаний \
+                             «инструмент» и «результаты поиска».",
+                            outcome.detail.chars().take(2500).collect::<String>()
+                        );
+                        let mut summary = String::new();
+                        if let Some(engine) = guard.as_mut() {
+                            let _ = engine.generate_streaming_with_params(
+                                &system_for_summary,
+                                &history_snapshot,
+                                &ask,
+                                None,
+                                &cancel,
+                                |sentence| {
+                                    let _ = audio_tx.send(AudioMessage::SynthesizeAndPlay(
+                                        sentence.to_string(),
+                                    ));
+                                },
+                                |full| summary = full.to_string(),
+                            );
+                        }
+                        let summary = tools::strip_tool_blocks(&summary);
+                        if summary.trim().is_empty() {
+                            outcome.speech
+                        } else {
+                            summary
+                        }
+                    }
+                    None => outcome.speech,
+                }
+            } else if outcome.ok {
+                outcome.speech
+            } else {
+                // Единая семантика с action-веткой: неудача инструмента
+                // возвращается модели один раз — попытка починить, а не
+                // озвучивание ошибки как готового ответа.
+                match wait_for_engine(&shared, Duration::from_secs(LLM_WAIT_TIMEOUT_SECS)) {
+                    Some(mut guard) => {
+                        let retry = format!(
+                            "Инструмент вернул НЕУДАЧУ: {}. Кратко объясни пользователю                              причину по-русски и предложи, что сделать. Без tool-блоков.",
+                            outcome.detail.chars().take(500).collect::<String>()
+                        );
+                        match guard.as_mut().and_then(|eng| {
+                            eng.generate_streaming_with_params(
+                                &effective_system,
+                                &history_snapshot,
+                                &retry,
+                                None,
+                                &cancel,
+                                |_| {},
+                                |_| {},
+                            )
+                            .ok()
+                        }) {
+                            Some(explanation) if !explanation.trim().is_empty() => {
+                                tools::strip_tool_blocks(&explanation)
+                            }
+                            _ => outcome.speech,
+                        }
+                    }
+                    None => outcome.speech,
+                }
+            };
+            {
+                let mut buf = history.lock().unwrap_or_else(|e| e.into_inner());
+                buf.push((prompt.clone(), speech.clone()));
+                let excess = buf.len().saturating_sub(MAX_HISTORY_ENTRIES);
+                buf.drain(..excess);
+            }
+            let _ = audio_tx.send(AudioMessage::SynthesizeAndPlay(speech.clone()));
+            let _ = events.send(JarvisEvent::LlmDone { text: speech });
+            return;
+        }
+        // Модель 2B иногда прикладывает к ответу tool-блок — выдуманный
+        // («ЯЗЫК_РАСТ») или битый. Сырой JSON в чат и озвучку не идёт:
+        // если весь ответ был таким блоком — честно объясняем словами,
+        // если блок прилип к тексту — остаётся только текст.
+        let text = if let tools::ToolParse::Failed(reason) = tools::parse(&text)
+            && text.trim_start().starts_with("<tool>")
+        {
+            tools::failure_speech(&text, &reason)
+        } else {
+            tools::strip_tool_blocks(&text)
+        };
+        {
+            let mut buf = history.lock().unwrap_or_else(|e| e.into_inner());
+            buf.push((prompt.clone(), text.clone()));
+            let excess = buf.len().saturating_sub(MAX_HISTORY_ENTRIES);
+            buf.drain(..excess);
+        }
+        crate::topic::remember(&prompt, &text);
+        // Долговременная память: фоновая экстракция фактов из обмена
+        // (логика OpenJarvis) — не тормозит диалог, ошибки молча деградируют.
+        crate::memory::extract_async(Arc::clone(&shared), prompt.clone(), text.clone());
+        let _ = events.send(JarvisEvent::LlmDone { text });
+        ask_done();
+    }))
+}
+
+/// Сколько раз за одну фразу агент может вызвать инструмент.
+pub const MAX_TOOL_STEPS: usize = 12;
+
+/// Потолок шагов для задач с экраном: Computer Use многошаговый по природе
+/// (прочитать экран → клик → проверить → следующий элемент), простые
+/// «включи громкость» укладываются в MAX_TOOL_STEPS с запасом.
+pub const MAX_GUI_TOOL_STEPS: usize = 16;
+
+/// Похоже ли просят поработать с экраном (ui_*, screen_read, клики по
+/// координатам)? Речь только о потолке шагов, не о маршрутизации: лишнее
+/// совпадение безвредно.
+fn is_gui_task(prompt: &str) -> bool {
+    let p = prompt.to_lowercase();
+    [
+        "на экране",
+        "экран",
+        "кликни",
+        "нажми",
+        "кнопк",
+        "пункт меню",
+        "в меню",
+        "введи в поле",
+        "впиши в поле",
+        "заполни",
+        "установи галочку",
+        "поставь галочку",
+    ]
+    .iter()
+    .any(|k| p.contains(k))
+}
+
+/// С какой уверенности роутера форсировать tool-блок префиллом.
+///
+/// Ниже порога модель получает свободу ответить текстом: лучше честный
+/// текстовый ответ на неуверенно распознанное действие, чем выдуманный
+/// инструмент, который пользователь слышит как «галлюцинацию».
+pub const FORCE_TOOL_CONFIDENCE: f32 = 0.7;
+
+/// Начало ответа, которое мы подставляем вместо модели на первом шаге.
+pub const TOOL_PREFILL: &str = "<tool>{\"name\":\"";
+
+/// Для просьб «открой сайт» имя инструмента и схему можно задать заранее.
+pub const SITE_OPEN_PREFILL: &str = "<tool>{\"name\":\"open_url\",\"args\":{\"url\":\"https://";
+
+fn action_params() -> config::GenerationParams {
+    config::GenerationParams {
+        temperature: 0.2,
+        top_p: 0.85,
+        repeat_penalty: 1.15,
+        repeat_window: 64,
+        // Без лимита: длинная команда в tool-JSON должна досказаться целиком —
+        // обрыв посередине раньше давал ложное «не могу выполнить».
+        max_tokens: 0,
+    }
+}
+
+/// Склейка prefill с продолжением ответа. Candle дописывает
+/// `<tool>{"name":"` в промпт, но не в возвращаемый текст; uzu prefill
+/// игнорирует и пишет блок целиком. Если модель собрала вызов сама —
+/// оставляем её текст; если вызов собирается только с префиксом — склеиваем;
+/// иначе (обычный текст) возвращаем как есть — разбор и дожим ветками ниже.
+fn join_prefill(prefill: &str, text: String) -> String {
+    if matches!(tools::parse_lenient(&text), tools::ToolParse::Call(_)) {
+        return text;
+    }
+    let joined = format!("{prefill}{text}");
+    if matches!(tools::parse_lenient(&joined), tools::ToolParse::Call(_)) {
+        println!("🧩 Собрал tool-блок из prefill-продолжения");
+        joined
+    } else {
+        text
+    }
+}
+
+pub(crate) fn speak(audio_tx: &Sender<AudioMessage>, events: &EventTx, text: &str) {
+    let text = if text.trim().is_empty() {
+        "Готово".to_string()
+    } else {
+        text.trim().to_string()
+    };
+    let _ = audio_tx.send(AudioMessage::SynthesizeAndPlay(text.clone()));
+    let _ = events.send(JarvisEvent::LlmDone { text });
+}
+
+/// Реплика только событиями, без аудио-конвейера — iOS: интерфейс сам
+/// показывает текст и озвучивает его системным синтезом речи.
+pub fn speak_events(events: &EventTx, text: &str) {
+    let text = text.trim().to_string();
+    let _ = events.send(JarvisEvent::LlmChunk { text: text.clone() });
+    let _ = events.send(JarvisEvent::LlmDone { text });
+}
+
+/// Озвучка с учётом отмены: пользователь сказал «стоп» — никакого «Готово»
+/// поверх отменённой генерации, тишина и есть честный ответ.
+fn speak_cancelable(
+    audio_tx: &Sender<AudioMessage>,
+    events: &EventTx,
+    text: &str,
+    cancel: &AtomicBool,
+) {
+    if cancel.load(Ordering::Relaxed) {
+        println!("🛫 Отменено пользователем — молчание вместо «Готово»");
+        return;
+    }
+    if text.trim().is_empty() {
+        // Пустой ответ без отмены — это сбой генерации, не успех.
+        speak(audio_tx, events, "Ответ не получился, повтори запрос.");
+        return;
+    }
+    speak(audio_tx, events, text);
+}
+
+fn host_of(url: &str) -> Option<String> {
+    let s = url.trim();
+    let s = s
+        .strip_prefix("https://")
+        .or_else(|| s.strip_prefix("http://"))
+        .unwrap_or(s);
+    let host = s.split(['/', '?', '#']).next().unwrap_or("").trim();
+    let host = host
+        .trim_start_matches("www.")
+        .trim_end_matches('.')
+        .to_lowercase();
+    if host.is_empty() { None } else { Some(host) }
+}
+
+fn root_domain(host: &str) -> String {
+    const TWO_LEVEL: &[&str] = &[
+        "co.uk", "org.uk", "com.ru", "net.ru", "org.ru", "com.au", "com.br", "co.jp", "co.in",
+        "com.tr", "co.kr",
+    ];
+    let labels: Vec<&str> = host.split('.').filter(|l| !l.is_empty()).collect();
+    if labels.len() <= 2 {
+        return host.to_string();
+    }
+    let last2 = labels[labels.len() - 2..].join(".");
+    if TWO_LEVEL.contains(&last2.as_str()) {
+        labels[labels.len() - 3..].join(".")
+    } else {
+        last2
+    }
+}
+
+fn same_site(a: &str, b: &str) -> bool {
+    let (ra, rb) = (root_domain(a), root_domain(b));
+    ra == rb || a.ends_with(&format!(".{b}")) || b.ends_with(&format!(".{a}"))
+}
+
+fn translit_ru(word: &str) -> String {
+    crate::text::translit_ru(word)
+}
+
+fn verify_site_url(prompt: &str, proposed: &str, hits: &[crate::web::SearchHit]) -> (String, bool) {
+    let words = crate::site_cache::content_words(prompt);
+    let proposed_host = host_of(proposed);
+
+    let mut same: Vec<&crate::web::SearchHit> = hits
+        .iter()
+        .filter(|h| {
+            proposed_host
+                .as_ref()
+                .zip(host_of(&h.url).as_ref())
+                .is_some_and(|(ph, hh)| same_site(ph, hh))
+        })
+        .collect();
+    same.sort_by_key(|h| {
+        (
+            std::cmp::Reverse(address_score(&h.url, &words)),
+            h.url.len(),
+        )
+    });
+    if let Some(hit) = same.first() {
+        return (hit.url.clone(), true);
+    }
+
+    if let Some(hit) = hits
+        .iter()
+        .find(|h| domain_named_in_request(&h.url, &words))
+    {
+        return (hit.url.clone(), true);
+    }
+
+    (proposed.to_string(), false)
+}
+
+/// Финальный выбор адреса сайта: подтверждённый моделью — берём; иначе
+/// верхний результат поиска (поисковик знает бренд лучше 2B); выдача пуста —
+/// остаётся вариант модели.
+fn resolve_site_url(proposed: &str, confirmed: bool, hits: &[crate::web::SearchHit]) -> String {
+    if confirmed || hits.is_empty() {
+        return proposed.to_string();
+    }
+    hits[0].url.clone()
+}
+
+fn address_score(url: &str, words: &[String]) -> usize {
+    if words.is_empty() {
+        return 0;
+    }
+    let tokens = crate::site_cache::content_words(url);
+    words.iter().filter(|w| word_in_tokens(w, &tokens)).count()
+}
+
+fn domain_named_in_request(url: &str, words: &[String]) -> bool {
+    let Some(host) = host_of(url) else {
+        return false;
+    };
+    let labels: Vec<String> = root_domain(&host)
+        .split('.')
+        .filter(|l| !l.is_empty())
+        .map(translit_ru)
+        .filter(|l| l.chars().count() >= 4)
+        .collect();
+    if labels.is_empty() {
+        return false;
+    }
+    words.iter().any(|w| {
+        let q = translit_ru(w);
+        if q.chars().count() < 4 {
+            return false;
+        }
+        let head: String = q.chars().take(4).collect();
+        labels.iter().any(|l| {
+            crate::text::word_similarity(&q, l) >= 0.72
+                || crate::text::word_similarity(&head, l) >= 0.7
+        })
+    })
+}
+
+fn explicit_domain(prompt: &str) -> Option<String> {
+    for raw in prompt.split_whitespace() {
+        let tok = raw.trim_matches(|c: char| !c.is_ascii_alphanumeric() && c != '.' && c != '-');
+        let Some((name, tld)) = tok.rsplit_once('.') else {
+            continue;
+        };
+        let tld_ok = tld.chars().count() >= 2 && tld.chars().all(|c| c.is_ascii_alphabetic());
+        let name_ok = !name.is_empty()
+            && name.chars().any(|c| c.is_ascii_alphabetic())
+            && name
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '.');
+        if tld_ok && name_ok {
+            return Some(tok.to_lowercase());
+        }
+    }
+    None
+}
+
+fn word_in_tokens(word: &str, tokens: &[String]) -> bool {
+    let t = translit_ru(word);
+    let sub = t.chars().count() >= 4;
+    tokens.iter().any(|tok| {
+        tok == &t
+            || tok == word
+            || (sub && tok.contains(&t))
+            || (sub && !tok.is_empty() && t.contains(tok.as_str()))
+            || crate::text::word_similarity(&t, tok) >= 0.58
+    })
+}
+
+fn looks_like_site_request(text: &str) -> bool {
+    let t = text.to_lowercase();
+    let site = has_site_word(&t);
+    let verb = [
+        "открой",
+        "откройте",
+        "зайди",
+        "зайти",
+        "перейди",
+        "перейти",
+        "заходи",
+        "посети",
+        "open",
+    ]
+    .iter()
+    .any(|k| t.contains(k));
+    let not_site = [
+        "файл",
+        "папк",
+        "задач",
+        "таймер",
+        "напомни",
+        "заметк",
+        "стих",
+        "сказк",
+        "письм",
+        "почт",
+        "музык",
+        "видео",
+        "фото",
+        "карт",
+        "календар",
+        "контакт",
+        "приложен",
+        "утилит",
+        "окно",
+        "анимаци",
+        "реактор",
+    ]
+    .iter()
+    .any(|k| t.contains(k));
+    !not_site && (site || verb)
+}
+
+fn has_site_word(text: &str) -> bool {
+    ["сайт", "страниц", "интернет", "онлайн"]
+        .iter()
+        .any(|k| text.contains(k))
+}
+
+fn take_search(
+    prefetch: &mut Option<std::thread::JoinHandle<Option<Vec<crate::web::SearchHit>>>>,
+    prompt: &str,
+) -> Vec<crate::web::SearchHit> {
+    if let Some(handle) = prefetch.take() {
+        return handle.join().ok().flatten().unwrap_or_default();
+    }
+    let query = crate::site_cache::search_query(prompt);
+    if query.is_empty() {
+        return Vec::new();
+    }
+    crate::web::search(&query, 5).unwrap_or_default()
+}
+
+/// Короткое описание вызова для честного отказа при исчерпании шагов.
+fn tool_summary_of(call: &tools::ToolCall) -> String {
+    let name = tools::tool_name_public(call);
+    let arg = match call {
+        tools::ToolCall::Shell { cmd } => cmd.chars().take(60).collect(),
+        tools::ToolCall::OpenApp { name } | tools::ToolCall::QuitApp { name } => name.clone(),
+        tools::ToolCall::OpenUrl { url, .. } => url.chars().take(60).collect(),
+        tools::ToolCall::UiClick { .. } | tools::ToolCall::UiType { .. } => {
+            "действие на экране".into()
+        }
+        _ => String::new(),
+    };
+    if arg.is_empty() {
+        name.to_string()
+    } else {
+        format!("{name}: {arg}")
+    }
+}
+
+fn needs_next_step(call: &tools::ToolCall, outcome: &tools::ToolOutcome) -> bool {
+    match call {
+        tools::ToolCall::Shell { .. }
+        | tools::ToolCall::FileRead { .. }
+        | tools::ToolCall::FileList { .. } => true,
+        // Результат оконной команды финален: после честного «свернул»/«нет
+        // окон» модель получала слово и начинала выдумывать причины ошибки.
+        tools::ToolCall::Window { .. } => false,
+        // Ввод/ожидание — звенья сценария интерфейса: модель должна продолжить
+        // цепочку и сама решить, остались ли действия.
+        tools::ToolCall::DesktopInput { .. } | tools::ToolCall::Wait { .. } => true,
+        tools::ToolCall::WebSearch { .. } => outcome.ok,
+        tools::ToolCall::RunCommand { .. } => {
+            !outcome.ok || outcome.detail.starts_with("Результаты поиска")
+        }
+        // Запись файла, снимок и уведомление раньше обрывали цепочку даже при
+        // успехе: «сделай» превращалось в один вызов и стоп. Теперь модель
+        // сама говорит, закончила она или продолжает. Защита от повторов и
+        // лимит шагов на месте, поэтому цикла это не создаёт.
+        tools::ToolCall::FileWrite { .. }
+        | tools::ToolCall::Screenshot
+        | tools::ToolCall::Notify { .. } => true,
+        // Плеер: успех — это готовый ответ («Поставил на паузу»), и лишний
+        // круг модели тут только добавлял «Задача завершена» после команды.
+        // Неудача — наоборот: пусть модель объяснит причину словами.
+        tools::ToolCall::MusicControl { .. } => !outcome.ok,
+        // Экранная автоматизация: ui_read/screen_read — информация для
+        // следующего шага, как file_read; клик/ввод/меню — звенья сценария,
+        // модель сама решает, доведена ли задача (итог клика приходит со
+        // снимком экрана).
+        tools::ToolCall::UiRead { .. }
+        | tools::ToolCall::ScreenRead
+        | tools::ToolCall::UiClick { .. }
+        | tools::ToolCall::UiType { .. }
+        | tools::ToolCall::UiMenu { .. } => true,
+        // Запуск/закрытие приложения и открытие ссылки — звенья цепочки
+        // («открой сафари сайт авиасейлс» = open_app + open_url).
+        // Раньше цикл обрывался после первого шага, и задача не доводилась.
+        tools::ToolCall::OpenApp { .. } | tools::ToolCall::QuitApp { .. } => true,
+        tools::ToolCall::OpenUrl { .. } | tools::ToolCall::OpenPath { .. } => true,
+        _ => !outcome.ok,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_action(
+    shared: &SharedLlm,
+    system: &str,
+    prompt: &str,
+    confidence: f32,
+    audio_tx: &Sender<AudioMessage>,
+    events: &EventTx,
+    cancel: &Arc<AtomicBool>,
+    history: &Arc<std::sync::Mutex<Vec<ChatTurn>>>,
+) {
+    // Новый запрос пользователя — новая задача: флаг отмены автоматизации от
+    // прошлого «стоп» снят, экран снова можно трогать.
+    crate::auto::clear_cancel();
+    // Контекст задачи: последние обмены из общей истории. Уточнения,
+    // местоимения и продолжения («а теперь закрой его») относятся к
+    // текущей задаче, а не начинаются с нуля.
+    let loop_history: Vec<ChatTurn> = {
+        let buf = history.lock().unwrap_or_else(|e| e.into_inner());
+        buf.iter().rev().take(6).rev().cloned().collect()
+    };
+    let mut loop_history = loop_history;
+    // Наблюдение до действия: агент видит окна, плеер, буфер и счётчики,
+    // а не угадывает состояние системы по названию просьбы.
+    let observe_now = || crate::observe::brief(&crate::observe::snapshot());
+    let mut user_msg = format!("{}\n\n{}", prompt, observe_now());
+    // Промпт шага не постоянен: после веб-поиска переключаемся на веб-промпт
+    // (ответ строго по результатам), иначе модель продолжает «задачу».
+    let mut active_system: String = system.to_string();
+    // Режим исследования: web_search возвращает сниппеты модели для новых
+    // поисков, а не сразу в озвучку (см. ветку WebSearch ниже).
+    let research = system == RESEARCH_SYSTEM_PROMPT;
+    let mut active_task: Option<crate::tasks::Task> = None;
+    let mut nudged = false;
+    let mut done_calls: Vec<String> = Vec::new();
+    let mut searched = false;
+    // Роутер не был уверен, что это действие. Тогда prefill не форсируем:
+    // если модель хочет ответить текстом — пусть ответит, это дешевле, чем
+    // выдуманный tool-вызов, из-за которого пользователь слышит чушь.
+    let force_tool = confidence >= FORCE_TOOL_CONFIDENCE;
+    // Диагностика выбора: вердикт роутера виден в журнале UI.
+    let _ = events.send(JarvisEvent::RouterVerdict {
+        intent: "action".into(),
+        confidence,
+        force_tool,
+    });
+    // «Открой сайт X в сафари»: слово браузера не должно попадать ни в поиск,
+    // ни в ключ кэша сайтов, а сам браузер передаётся в open_url.
+    let (site_prompt_owned, browser_hint) = crate::tool_guard::strip_browser_phrase(prompt);
+    let site_prompt: &str = site_prompt_owned.as_str();
+    let site_request = looks_like_site_request(prompt);
+    let fast_site = site_request && has_site_word(&prompt.to_lowercase());
+    let mut prefetch = if site_request {
+        let query = crate::site_cache::search_query(site_prompt);
+        if query.is_empty() {
+            None
+        } else {
+            Some(std::thread::spawn(move || {
+                crate::web::search(&query, 5).ok()
+            }))
+        }
+    } else {
+        None
+    };
+
+    // Uzu не умеет prefill, поэтому SITE_OPEN_PREFILL там не срабатывает и
+    // модель сама выбирает инструмент («открой сайт X в сафари» превращалось
+    // в open_app + ui_task). Адрес для «открой сайт …» не требует LLM: берём
+    // его из выдачи поиска, которая уже запущена, и открываем сразу.
+    if fast_site && config::backend() == "uzu" {
+        let hits = take_search(&mut prefetch, site_prompt);
+        if !hits.is_empty() {
+            let (candidate, confirmed) = verify_site_url(site_prompt, "", &hits);
+            let final_url = resolve_site_url(&candidate, confirmed, &hits);
+            println!("🎯 Сайт без LLM (бэкенд без prefill): {final_url}");
+            let outcome = tools::execute(
+                tools::ToolCall::OpenUrl {
+                    url: final_url.clone(),
+                    browser: browser_hint.clone(),
+                },
+                audio_tx,
+                events,
+            );
+            if outcome.ok && confirmed {
+                crate::site_cache::remember(site_prompt, &final_url);
+            }
+            speak_cancelable(audio_tx, events, &outcome.speech, cancel);
+            commit_action_history(history, prompt, &outcome.speech);
+            return;
+        }
+    }
+
+    let max_steps = if is_gui_task(prompt) {
+        MAX_GUI_TOOL_STEPS
+    } else {
+        MAX_TOOL_STEPS
+    };
+    for step in 1..=max_steps {
+        let mut used_prefill: Option<&'static str> = None;
+        let generated = {
+            // Неудачная загрузка выбранного бэкенда — честный отказ и в
+            // агентном цикле: без проверки цикл уводил бы вопрос в старый
+            // движок из слота, игнорируя выбор пользователя.
+            if shared.failed.load(Ordering::SeqCst) {
+                report_engine_unavailable(shared, &events, &audio_tx);
+                return;
+            }
+            let Some(mut guard) =
+                wait_for_engine(shared, Duration::from_secs(LLM_WAIT_TIMEOUT_SECS))
+            else {
+                report_engine_unavailable(shared, &events, &audio_tx);
+                return;
+            };
+            let Some(engine) = guard.as_mut() else {
+                return;
+            };
+            let progress = |full: &str| {
+                let _ = events.send(JarvisEvent::LlmChunk {
+                    text: full.to_string(),
+                });
+            };
+
+            if step == 1 && force_tool {
+                let prefill = if fast_site {
+                    SITE_OPEN_PREFILL
+                } else {
+                    TOOL_PREFILL
+                };
+                used_prefill = Some(prefill);
+                engine.generate_streaming_with_prefill(
+                    &active_system,
+                    &loop_history,
+                    &user_msg,
+                    Some(action_params()),
+                    cancel,
+                    prefill,
+                    |_| {},
+                    progress,
+                )
+            } else {
+                engine.generate_streaming_with_params(
+                    &active_system,
+                    &loop_history,
+                    &user_msg,
+                    Some(action_params()),
+                    cancel,
+                    |_| {},
+                    progress,
+                )
+            }
+        };
+
+        let text = match generated {
+            Ok(t) => t,
+            Err(e) => {
+                eprintln!("⚠️ Ошибка генерации LLM: {e}");
+                let _ = events.send(JarvisEvent::Error {
+                    message: format!("Ошибка LLM: {e}"),
+                });
+                return;
+            }
+        };
+
+        // Отмена обрывает генерацию на полуслове: достраивать обрезанный
+        // JSON (parse_lenient) и исполнять его нельзя — усечённый shell.cmd
+        // становится другой командой.
+        if cancel.load(Ordering::Relaxed) {
+            println!("🛫 Отменено пользователем — ответ не разбирается и не исполняется");
+            return;
+        }
+        // Candle дописывает prefill в промпт, но не в возвращаемый текст:
+        // парсер видит «set_alarm","args":…</tool>» без головы
+        // «<tool>{"name":"» — вызов не собирается, тратится дожим-переспрос.
+        let text = match used_prefill {
+            Some(prefill) => join_prefill(prefill, text),
+            None => text,
+        };
+        let parsed = match tools::parse_lenient(&text) {
+            tools::ToolParse::None => tools::parse_bare(&text),
+            other => other,
+        };
+        match parsed {
+            tools::ToolParse::Call(tools::ToolCall::TaskRun { id }) => {
+                if step == max_steps {
+                    // Перезапись user_msg на последнем шаге раньше приводила к
+                    // «слишком много шагов» без единого выполненного действия.
+                    speak_cancelable(
+                        audio_tx,
+                        events,
+                        "Шагов не осталось — запускаю задачу в следующий раз.",
+                        cancel,
+                    );
+                    return;
+                }
+                let task = id
+                    .and_then(crate::tasks::find)
+                    .filter(|t| !t.done)
+                    .or_else(|| crate::tasks::pending().into_iter().next());
+                let Some(task) = task else {
+                    speak(audio_tx, events, &crate::tasks::speak_next());
+                    return;
+                };
+                println!("▶️ Задача {}: {}", task.id, task.text);
+                loop_history.push((user_msg.clone(), text.clone()));
+                user_msg = format!(
+                    "Задача {}: {}\nВыполни её инструментами, шаг за шагом. \
+                     Когда всё готово — ответь одним коротким предложением без tool.",
+                    task.id, task.text
+                );
+                active_task = Some(task);
+            }
+
+            tools::ToolParse::Call(call) => {
+                println!("🔧 Tool call (шаг {step}/{max_steps}): {call:?}");
+                let mut cache_url: Option<String> = None;
+                let mut cache_confirmed = false;
+                let call = match call {
+                    tools::ToolCall::OpenUrl { url, browser } if !searched => {
+                        let browser = browser.or_else(|| browser_hint.clone());
+                        match explicit_domain(site_prompt) {
+                            Some(domain) => {
+                                let exact = format!("https://{domain}/");
+                                cache_url = Some(exact.clone());
+                                cache_confirmed = true; // домен назван явно
+                                tools::ToolCall::OpenUrl {
+                                    url: exact,
+                                    browser,
+                                }
+                            }
+                            None => {
+                                let hits = take_search(&mut prefetch, site_prompt);
+                                let (candidate, confirmed) =
+                                    verify_site_url(site_prompt, &url, &hits);
+                                // Модель выдумывает адреса («дипсика» → Dipstick
+                                // на вики): если выдача её не подтвердила,
+                                // открываем верхний результат поиска — поисковик
+                                // понимает «дипсика» лучше маленькой модели.
+                                let final_url = resolve_site_url(&candidate, confirmed, &hits);
+                                if final_url != url {
+                                    println!("🎯 Беру адрес из выдачи: {final_url}");
+                                }
+                                // Кэш отравлять нельзя: запоминаем только
+                                // URL, который подтвердила выдача или явный
+                                // домен из фразы.
+                                cache_url = confirmed.then(|| final_url.clone());
+                                cache_confirmed = confirmed;
+                                tools::ToolCall::OpenUrl {
+                                    url: final_url,
+                                    browser,
+                                }
+                            }
+                        }
+                    }
+                    other => {
+                        let other = match other {
+                            tools::ToolCall::OpenUrl { url, browser: None }
+                                if browser_hint.is_some() =>
+                            {
+                                tools::ToolCall::OpenUrl {
+                                    url,
+                                    browser: browser_hint.clone(),
+                                }
+                            }
+                            o => o,
+                        };
+                        if let tools::ToolCall::OpenUrl { url, .. } = &other {
+                            // Повторное открытие сайта в том же цикле — модель
+                            // уже назвала конкретный адрес: считаем явным.
+                            cache_url = Some(url.clone());
+                            cache_confirmed = true;
+                        }
+                        other
+                    }
+                };
+                // web_search с пустым запросом (частый паттерн 2B): запрос —
+                // сама фраза пользователя, а не провал парсинга.
+                let call = match call {
+                    tools::ToolCall::WebSearch { query }
+                        if query.trim().is_empty() && !searched =>
+                    {
+                        tools::ToolCall::WebSearch {
+                            query: prompt.to_string(),
+                        }
+                    }
+                    other => other,
+                };
+                if let tools::ToolCall::WebSearch { .. } = &call {
+                    searched = true;
+                }
+
+                let call_key = format!("{call:?}");
+                if done_calls.contains(&call_key) {
+                    println!("🛑 Повтор команды — цикл прерван: {call_key}");
+                    if let Some(task) = active_task.take() {
+                        offer_close_task(audio_tx, events, &task);
+                    } else {
+                        speak_cancelable(
+                            audio_tx,
+                            events,
+                            "Эту команду я уже выполнял. Останавливаюсь.",
+                            cancel,
+                        );
+                    }
+                    return;
+                }
+                done_calls.push(call_key.clone());
+
+                let outcome = tools::execute(call.clone(), audio_tx, events);
+                if let (Some(url), true) = (cache_url, cache_confirmed)
+                    && outcome.ok
+                {
+                    crate::site_cache::remember(site_prompt, &url);
+                }
+                // Обучение: первый шаг запроса выполнился успешно — фраза
+                // с этим действием идёт в память команд (безопасные
+                // инструменты только; shell и файлы память не учит).
+                if outcome.ok && step == 1 {
+                    if crate::learned::remember(prompt, &text) {
+                        println!(
+                            "🧠 Запомнил: «{prompt}» → {}",
+                            tools::tool_name_public(&call)
+                        );
+                    }
+                }
+                let last_step = step == max_steps;
+                if last_step || !needs_next_step(&call, &outcome) {
+                    // Исчерпание шагов — отказ с описанием прогресса, не
+                    // молчаливое «готово»: пользователь слышит, на чём
+                    // остановились и почему.
+                    let speech = if last_step && needs_next_step(&call, &outcome) {
+                        format!(
+                            "Шагов не осталось — остановился после: {}. {}",
+                            tool_summary_of(&call),
+                            outcome.speech
+                        )
+                    } else {
+                        outcome.speech.clone()
+                    };
+                    if let Some(task) = active_task.take() {
+                        offer_close_task(audio_tx, events, &task);
+                    } else {
+                        speak_cancelable(audio_tx, events, &speech, cancel);
+                    }
+                    commit_action_history(history, prompt, &speech);
+                    return;
+                }
+                loop_history.push((user_msg.clone(), text.clone()));
+                if matches!(&call, tools::ToolCall::WebSearch { .. }) && !research {
+                    // Результаты поиска — не «продолжай задачу», а материал
+                    // для ответа: переключаемся на веб-промпт и отдаём
+                    // сниппеты целиком. Голые заголовки модель 2B превращает
+                    // в выдумку по названию («азартный досоло» про Руми-куб).
+                    active_system = format!(
+                        "{}\nСегодняшняя дата: {}.",
+                        WEB_SYSTEM_PROMPT,
+                        crate::text::today_russian()
+                    );
+                    user_msg = outcome.detail;
+                } else if matches!(&call, tools::ToolCall::WebSearch { .. }) {
+                    // Исследование: сниппеты возвращаются модели как материал,
+                    // следующий шаг — новый web_search или финальная сводка.
+                    active_system = format!(
+                        "{}\nСегодняшняя дата: {}.",
+                        RESEARCH_SYSTEM_PROMPT,
+                        crate::text::today_russian()
+                    );
+                    loop_history.push((user_msg.clone(), text.clone()));
+                    user_msg = format!(
+                        "Результаты поиска:\n{}\n\nПродолжай: если данных мало — ещё web_search по новой формулировке;                          если достаточно — финальная сводка текстом (вывод, факты, источники доменами), без tool.",
+                        outcome.detail.chars().take(3000).collect::<String>()
+                    );
+                } else {
+                    // Результат шага + свежее наблюдение среды: сравнение с
+                    // целью по факту, а не по памяти модели.
+                    let brief: String = outcome.detail.chars().take(800).collect();
+                    let status_note = if outcome.ok {
+                        "успех"
+                    } else {
+                        "НЕУДАЧА"
+                    };
+                    let empty_note = if outcome.ok && brief.trim().is_empty() {
+                        " Команда ничего не вывела — это нормально, она уже выполнена."
+                    } else {
+                        ""
+                    };
+                    // Провал open_app — не повод открывать что-то другое:
+                    // ни приложение, ни сайт, ни файл вместо несуществующей
+                    // программы. Пользователь должен услышать честную причину.
+                    let app_note =
+                        if matches!(&call, tools::ToolCall::OpenApp { .. }) && !outcome.ok {
+                            " Приложение не найдено. НЕ открывай вместо него другое приложение, \
+                             сайт или файл и не выдумывай имена. Скажи пользователю, что это \
+                             приложение не найдено."
+                        } else if matches!(
+                            &call,
+                            tools::ToolCall::UiClick { .. }
+                                | tools::ToolCall::UiType { .. }
+                                | tools::ToolCall::UiMenu { .. }
+                        ) && !outcome.ok
+                        {
+                            " Действие на экране не удалось. Сперва ui_read — узнай реальные \
+                             имена элементов, затем попробуй другое имя/роль или другой путь \
+                             (applescript, desktop_input с точными координатами). \
+                             Скажи пользователю причину."
+                        } else {
+                            ""
+                        };
+                    let done_list = done_calls.join("; ");
+                    // Перечитывание после шага — обязательная часть цикла:
+                    // модель сверяет цель с фактом, а не с памятью.
+                    let observation = observe_now();
+                    user_msg = format!(
+                        "Результат инструмента ({status_note}): {brief}{empty_note}{app_note}\n\
+                         Уже выполнено: {done_list}. Не повторяй эти команды.\n\
+                         {observation}\n\
+                         Сверь обстановка с целью: если цель ещё не подтверждена — следующий шаг; \
+                         если подтверждена — ответь коротко, без tool."
+                    );
+                }
+            }
+
+            tools::ToolParse::Failed(reason) => {
+                eprintln!("⚠️ Tool-вызов не разобран: {reason}");
+                eprintln!("   сырой ответ: {text}");
+                let _ = events.send(JarvisEvent::ToolParseFailed {
+                    reason: reason.clone(),
+                    raw: text.chars().take(400).collect(),
+                });
+                // Выдуманный инструмент может совпадать с командой
+                // пользователя из commands.toml («Finder»): выполняем ЕЁ, а не
+                // гуглим её название. Команды с поиском (web/search) не
+                // берём: им нужна выдача для модели, а не голосовой ответ.
+                if let Some((name, args)) = tools::raw_call(&text)
+                    && let Ok(cfg) =
+                        crate::commands::CommandsConfig::load(&crate::paths::commands_file())
+                    && let Some(cmd) = cfg.find_command_by_name(&name)
+                    && !matches!(cmd.action_type.trim(), "web" | "search")
+                {
+                    println!(
+                        "🔧 Выдуманный инструмент «{name}» — это команда «{}»: выполняю её",
+                        cmd.name
+                    );
+                    let outcome =
+                        crate::commands::run_command_from(&cfg, &cmd.name, &args, audio_tx, events);
+                    speak(audio_tx, events, &outcome.speech);
+                    return;
+                }
+                // Роутер не был уверен, а модель выдумала инструмент. Второй
+                // раз требовать tool бессмысленно: отвечаем как на вопрос.
+                if !force_tool && step == 1 {
+                    println!("↩️ Неуверенный action + выдуманный tool — отвечаю текстом");
+                    speak(
+                        audio_tx,
+                        events,
+                        "Не понял, что именно сделать. Скажи точнее — что открыть или выполнить?",
+                    );
+                    return;
+                }
+                if step == 1 && !nudged {
+                    nudged = true;
+                    loop_history.push((user_msg.clone(), text.clone()));
+                    // Подсказка держит модель на цели: выдуманного инструмента
+                    // нет — исполняй цель реальным инструментом из списка, а
+                    // не гугли его название и не рассказывай про него.
+                    user_msg = format!(
+                        "Твой tool-блок не разобран: {reason}. Такого инструмента нет. \
+                         Цель пользователя: {prompt}. Выбери реальный инструмент строго из \
+                         списка системного промпта, который исполняет эту цель, и ответь \
+                         ОДНИМ корректным tool-блоком вида \
+                         <tool>{{\"name\":\"open_url\",\"args\":{{...}}}}</tool>. \
+                         Не гугли название выдуманного инструмента и не описывай его."
+                    );
+                    continue;
+                }
+                speak(audio_tx, events, &tools::failure_speech(&text, &reason));
+                return;
+            }
+
+            tools::ToolParse::None => {
+                println!("🗣 LLM без tool: {text}");
+                // Отмена («стоп») превыше всего: никакой дожим, никакая речь.
+                if cancel.load(Ordering::Relaxed) {
+                    println!("🛫 Отменено пользователем — выходим без озвучки");
+                    return;
+                }
+                // Если роутер сомневался — текстовый ответ и есть правильный
+                // исход, дожимать tool-блок не нужно.
+                if step == 1 && !nudged && !text.trim().is_empty() && force_tool {
+                    nudged = true;
+                    loop_history.push((user_msg.clone(), text.clone()));
+                    user_msg = "Пользователь просил выполнить действие, а ты ответил \
+                        текстом. Ответь ТОЛЬКО одним tool-блоком \
+                        <tool>{\"name\":\"...\",\"args\":{...}}</tool> — без единого слова."
+                        .to_string();
+                    continue;
+                }
+                match active_task.take() {
+                    Some(task) => offer_close_task(audio_tx, events, &task),
+                    None => speak_cancelable(audio_tx, events, &text, cancel),
+                }
+                // Итог действия — в общую историю: уточнения «открой его» и
+                // «а теперь закрой» должны видеть, что именно выполнялось.
+                commit_action_history(history, prompt, &text);
+                return;
+            }
+        }
+    }
+
+    speak_cancelable(
+        audio_tx,
+        events,
+        "Остановился: слишком много шагов.",
+        cancel,
+    );
+}
+
+/// Итог действия в общую историю диалога (Этап «контекст»): фраза
+/// пользователя и честный итог действия. Без этого уточнения вроде
+/// «открой его» и «а теперь закрой» не видят предыдущего действия.
+fn commit_action_history(
+    history: &Arc<std::sync::Mutex<Vec<ChatTurn>>>,
+    prompt: &str,
+    result: &str,
+) {
+    let result = result.trim();
+    if result.is_empty() {
+        return;
+    }
+    let mut buf = history.lock().unwrap_or_else(|e| e.into_inner());
+    buf.push((prompt.to_string(), result.to_string()));
+    let excess = buf.len().saturating_sub(MAX_HISTORY_ENTRIES);
+    buf.drain(..excess);
+}
+
+fn offer_close_task(audio_tx: &Sender<AudioMessage>, events: &EventTx, task: &crate::tasks::Task) {
+    crate::tasks::expect_done(task.id, &task.text);
+    println!("⏳ Жду ответа по задаче {}: {}", task.id, task.text);
+    speak(
+        audio_tx,
+        events,
+        &format!(
+            "Задача {} — {} — сделана? Скажи да или нет.",
+            task.id, task.text
+        ),
+    );
+}
+
+pub fn sanitize_normalized(original: &str, output: &str) -> Option<String> {
+    let out = output
+        .trim()
+        .trim_start_matches(['"', '\u{ab}', '\u{bb}'])
+        .trim_end_matches(['"', '\u{ab}', '\u{bb}'])
+        .trim()
+        .to_string();
+
+    if out.is_empty() {
+        return None;
+    }
+    if !out.chars().any(|c| c.is_alphabetic()) {
+        return None;
+    }
+    if out.contains("пример") || out.contains("замени") {
+        return None;
+    }
+    let orig_chars = original.chars().count();
+    let out_chars = out.chars().count();
+    if out_chars > orig_chars * 4 + 40 || out_chars < orig_chars / 4 {
+        return None;
+    }
+    Some(out)
+}
+
+/// Нейро-нормализация текста для TTS без ожидания: если движок занят —
+/// сразу возвращает None, вызывающий откатывается на правила.
+pub fn try_normalize(shared: &SharedLlm, text: &str) -> Option<String> {
+    let Ok(mut guard) = shared.engine.try_lock() else {
+        return None;
+    };
+    let engine = guard.as_mut()?;
+    let cancel = Arc::new(AtomicBool::new(false));
+    let params = config::GenerationParams {
+        temperature: 0.2,
+        top_p: 0.8,
+        repeat_penalty: 1.15,
+        repeat_window: 64,
+        // Без обрыва: порезанная нормализация = порезанная озвучка.
+        max_tokens: 0,
+    };
+
+    let result = engine.generate_streaming_with_params(
+        NORMALIZE_SYSTEM_PROMPT,
+        &[],
+        text,
+        Some(params),
+        &cancel,
+        |_| {},
+        |_| {},
+    );
+
+    let raw = result.ok()?;
+    sanitize_normalized(text, &raw)
+}
+
+/// Синхронный вопрос-ответ (для тестов).
+pub fn generate_blocking(
+    shared: &SharedLlm,
+    system: &str,
+    history: &[ChatTurn],
+    user: &str,
+    cancel: &AtomicBool,
+) -> Result<String> {
+    let mut guard = wait_for_engine(shared, Duration::from_secs(LLM_WAIT_TIMEOUT_SECS))
+        .context("LLM недоступна")?;
+    let engine = guard.as_mut().context("LLM недоступна")?;
+    engine.generate_streaming(system, history, user, cancel, |_| {}, |_| {})
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn percent_from_prompt_extracts_first_number() {
+        // «поставь громкость на 30» → 30; «яркость 85 процентов» → 85.
+        assert_eq!(percent_from_prompt("поставь громкость на 30"), Some(30));
+        assert_eq!(percent_from_prompt("яркость 85 процентов"), Some(85));
+        // Число > 100 — не уровень: «таймер на 200 секунд» не громкость.
+        assert_eq!(percent_from_prompt("громкость 200"), None);
+        assert_eq!(percent_from_prompt("без чисел"), None);
+    }
+
+    #[test]
+    fn after_marker_keeps_case_and_takes_rest() {
+        // Регистр текста сохраняется: маркер ищется в lower-копии, а текст
+        // вырезается из исходной строки.
+        assert_eq!(
+            after_marker("Уведомь меня: Встреча В восемь", &["уведомь"]),
+            Some("Встреча В восемь".to_string())
+        );
+        assert_eq!(
+            after_marker("запиши в буфер — Пароль 123", &["запиши в буфер"]),
+            Some("Пароль 123".to_string())
+        );
+        // Маркера нет или после него пусто — None.
+        assert_eq!(after_marker("открой хром", &["уведомь"]), None);
+        assert_eq!(after_marker("уведомь:", &["уведомь"]), None);
+    }
+
+    #[test]
+    fn failed_reload_discards_stale_engine_state() {
+        // Регрессия: при неудачной загрузке нового бэкенда прежний движок
+        // оставался в слоте — выбранное облако молча подменялось локальной
+        // моделью. Слот обязан очищаться, а реплика — меняться с «загружается»
+        // на честный отказ.
+        let shared: SharedLlm = Arc::new(SharedLlmState::new());
+        *shared.active.lock().unwrap_or_else(|e| e.into_inner()) = Some(BackendInfo {
+            backend: "candle".into(),
+            preset: String::new(),
+            model: "qwen3.5-0.8b".into(),
+        });
+        shared.failed.store(true, Ordering::SeqCst);
+
+        discard_engine(&shared);
+        assert!(active_backend(&shared).is_none());
+        assert!(
+            shared
+                .engine
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .is_none()
+        );
+
+        let failed_msg = engine_unavailable_message(&shared);
+        shared.failed.store(false, Ordering::SeqCst);
+        assert_ne!(
+            failed_msg,
+            engine_unavailable_message(&shared),
+            "после сброса failed реплика снова «модель загружается»"
+        );
+    }
+
+    #[test]
+    fn normalize_sanitizer_rejects_garbage() {
+        assert_eq!(
+            sanitize_normalized("2 м/с", "два метра в секунду").unwrap(),
+            "два метра в секунду"
+        );
+        assert!(sanitize_normalized("2 м/с", "замени единицы на слова").is_none());
+        assert!(sanitize_normalized("2 м/с", "  ").is_none());
+        assert!(sanitize_normalized("2 м/с", &"два метра в секунду ".repeat(20)).is_none());
+    }
+
+    #[test]
+    fn host_extraction_normalizes() {
+        assert_eq!(
+            host_of("https://www.apple.com/ipad-pro").as_deref(),
+            Some("apple.com")
+        );
+        assert_eq!(host_of("cdek.ru").as_deref(), Some("cdek.ru"));
+        assert_eq!(host_of("  ").as_deref(), None);
+    }
+
+    #[test]
+    fn prefill_join_restores_tool_head() {
+        // Candle дописывает «<tool>{"name":"» в промпт, но не в ответ:
+        // продолжение без склейки парсер не собирает (живой лог: шаг 1 —
+        // «LLM без tool», шаг 2 — дожим-переспрос).
+        let joined = join_prefill(
+            TOOL_PREFILL,
+            "set_alarm\",\"args\":{\"hours\":24,\"minutes\":0}}</tool>".to_string(),
+        );
+        assert!(matches!(
+            tools::parse_lenient(&joined),
+            tools::ToolParse::Call(_)
+        ));
+        assert_eq!(
+            joined,
+            "<tool>{\"name\":\"set_alarm\",\"args\":{\"hours\":24,\"minutes\":0}}</tool>"
+        );
+    }
+
+    #[test]
+    fn prefill_join_keeps_complete_block() {
+        // Модель (uzu, либо самостоятельная) выдала блок целиком — не клеим
+        // префикс второй раз.
+        let full = "<tool>{\"name\":\"timer_stop\"}</tool>".to_string();
+        assert_eq!(join_prefill(TOOL_PREFILL, full.clone()), full);
+    }
+
+    #[test]
+    fn prefill_join_leaves_plain_text_alone() {
+        // Обычный текстовый ответ под force_tool — как был: без префикса,
+        // чтобы ветка дожима видела «ответил текстом», а не «выдуманный tool».
+        let plain = "Готов поставить будильник.".to_string();
+        assert_eq!(join_prefill(TOOL_PREFILL, plain.clone()), plain);
+    }
+
+    #[test]
+    fn prefill_join_restores_site_open() {
+        // SITE_OPEN_PREFILL: модель дописывает хвост адреса и закрывающие.
+        let joined = join_prefill(SITE_OPEN_PREFILL, "example.com\"}}</tool>".to_string());
+        assert!(matches!(
+            tools::parse_lenient(&joined),
+            tools::ToolParse::Call(tools::ToolCall::OpenUrl { url, .. })
+                if url == "https://example.com"
+        ));
+    }
+
+    #[test]
+    fn same_site_matches_subdomains() {
+        assert!(same_site("netflix.com", "about.netflix.com"));
+        assert!(same_site("www.netflix.com", "netflix.com"));
+        assert!(!same_site("sdekshop.com", "cdek.ru"));
+    }
+
+    #[test]
+    fn verify_keeps_brand_over_aggregator() {
+        let hits = vec![
+            crate::web::SearchHit {
+                title: "Купить Mercedes-Benz".into(),
+                url: "https://auto.ru/cars/mercedes/all/".into(),
+                snippet: String::new(),
+            },
+            crate::web::SearchHit {
+                title: "Mercedes в России".into(),
+                url: "https://mercedes-benz-russia.ru/".into(),
+                snippet: String::new(),
+            },
+        ];
+        let (url, confirmed) =
+            verify_site_url("открой сайт мерседес", "https://www.mercedes.com", &hits);
+        assert_eq!(url, "https://www.mercedes.com");
+        assert!(!confirmed);
+    }
+
+    #[test]
+    fn explicit_domain_is_detected() {
+        assert_eq!(
+            explicit_domain("открой сайт apple.com"),
+            Some("apple.com".to_string())
+        );
+        assert_eq!(explicit_domain("открой сайт дипсика"), None);
+    }
+}

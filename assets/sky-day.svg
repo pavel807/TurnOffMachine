@@ -1,0 +1,33 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 1100"
+     width="1200" height="1100" preserveAspectRatio="none">
+<defs>
+<linearGradient id="sky" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#1d4e89"/><stop offset="0.32" stop-color="#3a7cb8"/><stop offset="0.62" stop-color="#7fb6d9"/><stop offset="0.85" stop-color="#cfe6ef"/><stop offset="1" stop-color="#f3e3c6"/></linearGradient>
+<radialGradient id="sun" cx="0.5" cy="0.5" r="0.5"><stop offset="0" stop-color="#fffbe8" stop-opacity="0.95"/><stop offset="0.4" stop-color="#ffe9a8" stop-opacity="0.35"/><stop offset="1" stop-color="#ffe9a8" stop-opacity="0"/></radialGradient>
+<linearGradient id="cloudD" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#ffffff"/><stop offset="0.5" stop-color="#f2f7fb"/><stop offset="1" stop-color="#c3d5e4"/></linearGradient>
+<radialGradient id="haloD" cx="0.5" cy="0.5" r="0.5"><stop offset="0" stop-color="#ffffff" stop-opacity="0.35"/><stop offset="1" stop-color="#ffffff" stop-opacity="0"/></radialGradient>
+</defs>
+<rect width="1200" height="1100" fill="url(#sky)"/>
+<ellipse cx="905" cy="215" rx="430" ry="380" fill="url(#sun)"/>
+<circle cx="905" cy="215" r="46" fill="#fffdf0"/>
+<g>
+  <g transform="translate(250,262) scale(1.2)">
+    <ellipse cx="0" cy="-20" rx="122" ry="56" fill="url(#haloD)"/>
+    <path d="M-92,0A20,20 0 0 1 -70,-20A26,26 0 0 1 -24,-40A30,30 0 0 1 30,-38A22,22 0 0 1 68,-20A18,18 0 0 1 92,0Z" fill="url(#cloudD)"/>
+  </g>
+  <g transform="translate(560,192) scale(0.85)" opacity="0.85">
+    <ellipse cx="0" cy="-20" rx="122" ry="56" fill="url(#haloD)"/>
+    <path d="M-92,0A20,20 0 0 1 -70,-20A26,26 0 0 1 -24,-40A30,30 0 0 1 30,-38A22,22 0 0 1 68,-20A18,18 0 0 1 92,0Z" fill="url(#cloudD)"/>
+  </g>
+  <g transform="translate(820,336) scale(1.05)" opacity="0.75">
+    <ellipse cx="0" cy="-20" rx="122" ry="56" fill="url(#haloD)"/>
+    <path d="M-92,0A20,20 0 0 1 -70,-20A26,26 0 0 1 -24,-40A30,30 0 0 1 30,-38A22,22 0 0 1 68,-20A18,18 0 0 1 92,0Z" fill="url(#cloudD)"/>
+  </g>
+  <g transform="translate(1080,452) scale(0.7)" opacity="0.55">
+    <path d="M-60,0A14,14 0 0 1 -44,-14A20,20 0 0 1 -6,-26A18,18 0 0 1 28,-22A14,14 0 0 1 52,-8A10,10 0 0 1 60,0Z" fill="url(#cloudD)"/>
+  </g>
+  <g transform="translate(120,442) scale(0.62)" opacity="0.5">
+    <path d="M-60,0A14,14 0 0 1 -44,-14A20,20 0 0 1 -6,-26A18,18 0 0 1 28,-22A14,14 0 0 1 52,-8A10,10 0 0 1 60,0Z" fill="url(#cloudD)"/>
+  </g>
+</g>
+<g stroke="#ffffff" stroke-opacity="0.16" stroke-width="2" fill="none"><path d="M120,560 q60,-16 120,0"/><path d="M840,600 q70,-18 140,0"/></g>
+</svg>
